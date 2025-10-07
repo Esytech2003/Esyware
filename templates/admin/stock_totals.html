@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="h4 mb-3">Giacenze totali</h1>
+
+<div class="card shadow-sm">
+  <div class="card-body">
+    <div class="d-flex flex-wrap justify-content-between align-items-end gap-3 mb-3">
+      <div>
+        <h2 class="h6 m-0">Somma per prodotto (ultime giacenze per negozio)</h2>
+      </div>
+
+      <!-- Ricerca stile "form di aggiunta": input + pulsanti stondati -->
+      <form method="get" class="d-flex align-items-end gap-2">
+        <div>
+          <input type="search"
+                 class="form-control rounded-4"
+                 name="q"
+                 value="{{ q or '' }}"
+                 placeholder="Cerca prodotto…"
+                 autocomplete="off">
+        </div>
+        <div class="pb-1">
+          <button class="btn btn-primary rounded-4" type="submit">
+            <i class="bi bi-search me-1"></i>Cerca
+          </button>
+          {% if q %}
+          <a class="btn btn-outline-secondary rounded-4" href="{{ url_for('admin_stock_totals') }}">
+            Reset
+          </a>
+          {% endif %}
+        </div>
+      </form>
+    </div>
+
+    {% if rows|length == 0 %}
+      <div class="text-muted">Nessun dato disponibile{% if q %} per "<strong>{{ q }}</strong>"{% endif %}.</div>
+    {% else %}
+      {# Raggruppo per Reparto #}
+      {% for group in rows|groupby('product.department.name') %}
+
+        {# ---- fornitori unici per il reparto corrente ---- #}
+        {% set sup = namespace(names=[]) %}
+        {% for r in group.list %}
+          {% set sname =
+            (r.product.supplier.name
+              if (r.product is defined and r.product and r.product.supplier is defined
+                  and r.product.supplier and r.product.supplier.name)
+              else (r.product.supplier_name
+                    if (r.product is defined and r.product and r.product.supplier_name is defined
+                        and r.product.supplier_name)
+                    else (r.product.department.name
+                          if (r.product is defined and r.product and r.product.department
+                              and r.product.department.name) else 'Senza fornitore'))) %}
+          {% if sname not in sup.names %}
+            {% set _ = sup.names.append(sname) %}
+          {% endif %}
+        {% endfor %}
+
+        <!-- CHIP intestazione reparto + fornitori -->
+        <div class="group-chip mt-3 mb-2">
+          <div class="chip-title">{{ group.grouper or 'Senza reparto' }}</div>
+          {% if sup.names|length == 1 %}
+    
+          {% endif %}
+        </div>
+
+        <div class="table-responsive">
+          <table class="table table-sm align-middle table-fixed w-100">
+            <colgroup>
+              <col style="width: 55%"><!-- Prodotto -->
+              <col style="width: 8ch"><!-- Totale -->
+              <col style="width: auto"><!-- Dettaglio -->
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Prodotto</th>
+                <th class="text-end">Totale</th>
+                <th class="ps-4 border-start">Dettaglio per negozio</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for r in group.list %}
+              <tr>
+                <td class="fw-semibold">{{ r.product.name }}</td>
+                <td class="text-end fw-semibold">{{ r.total|fmt_qty }}</td>
+                <td class="text-muted ps-4 border-start">
+                  {% for client_name, qty in r.breakdown.items() %}
+                    <span class="me-2">{{ client_name }}: {{ qty|fmt_qty }}</span>
+                  {% endfor %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endfor %}
+
+      <div class="subtle small mt-2">
+        * Calcolato sull’<strong>ultima</strong> giacenza inviata da ciascun negozio.
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+<style>
+  .table-fixed{ table-layout: fixed; }
+  .table td.text-end{ font-variant-numeric: tabular-nums; }
+
+  /* chip reparto + fornitori (stesso stile degli altri) */
+  .group-chip{
+    display:inline-block;
+    padding:.45rem .75rem;
+    border-radius:14px;
+    background:#f7f8fa;
+    border:1px solid var(--border);
+    box-shadow: 0 4px 14px rgba(0,0,0,.06) inset, 0 6px 16px rgba(0,0,0,.04);
+  }
+  .chip-title{ font-weight:800; line-height:1.1; }
+  .chip-sub{
+    margin-top:.15rem;
+    font-size:.92rem;
+    font-weight:600;
+    color: var(--muted);
+  }
+  .chip-suppliers{ margin-top:.2rem; display:flex; flex-wrap:wrap; gap:.25rem .35rem; }
+  .chip-badge{
+    display:inline-block;
+    padding:.15rem .5rem;
+    border-radius:999px;
+    border:1px solid var(--border);
+    background:#fff;
+    font-size:.85rem;
+    font-weight:600;
+    line-height:1.1;
+  }
+</style>

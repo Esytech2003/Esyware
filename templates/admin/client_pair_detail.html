@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="h4 mb-3">
+  Dettaglio giacenze — {{ client.display_name }}
+  <small class="text-muted">({{ date_filter }}, pair #{{ rank }})</small>
+</h1>
+
+{% if sala_request or cucina_request %}
+  <div class="mb-3 text-muted">
+    {% if sala_request %}Sala: {{ sala_request.created_at|local_time }}{% endif %}
+    {% if sala_request and cucina_request %} · {% endif %}
+    {% if cucina_request %}Cucina: {{ cucina_request.created_at|local_time }}{% endif %}
+  </div>
+{% endif %}
+
+{# --- AREE DINAMICHE --- #}
+{% set total_areas = areas_blocks|length %}
+{% if not areas_blocks or total_areas == 0 %}
+  <div class="text-muted">Nessun articolo in questa coppia.</div>
+{% else %}
+  <div class="row g-3">
+    {% for area, blocks in areas_blocks.items() %}
+      <div class="col-12">
+        <div class="card shadow-sm h-100 mb-2">
+          <div class="card-body">
+            <h2 class="h6 mb-3" style="text-transform: capitalize;">{{ area }}</h2>
+            <div class="table-responsive">
+              <table class="table table-sm align-middle table-center-qty">
+                <tbody>
+                  {% for blk in blocks %}
+                    <tr>
+                      <td colspan="3">
+                        <div class="group-chip mt-2 mb-1">
+                          {{ blk.department or 'Senza reparto' }}
+                        </div>
+                      </td>
+                    </tr>
+                    <!-- sub-header SOTTO al chip -->
+                    <tr class="group-subhead">
+                      <th>Prodotto</th>
+                      <th class="col-qty text-center">Q.tà</th>
+                      <th class="col-spacer d-none d-md-table-cell"></th>
+                    </tr>
+                    {% for it in blk.rows %}
+                      <tr>
+                        <td>{{ it.product.name }}</td>
+                        <td class="col-qty text-center">{{ it.qty_requested|fmt_qty }}</td>
+                        <td class="col-spacer d-none d-md-table-cell"></td>
+                      </tr>
+                    {% endfor %}
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}
+
+<div class="d-flex justify-content-between align-items-center mt-3">
+  <a href="{{ url_for('admin_dashboard', date=date_filter) }}" class="btn btn-outline-secondary">
+    <i class="bi bi-arrow-left me-1"></i>Torna alla dashboard
+  </a>
+
+  <form method="post"
+        action="{{ url_for('admin_request_pair_delete') }}"
+        onsubmit="return confirm('Eliminare TUTTA la coppia di giacenze (Sala e/o Cucina, se presenti)?');">
+    <input type="hidden" name="req_id_1" value="{{ sala_request.id if sala_request else '' }}">
+    <input type="hidden" name="req_id_2" value="{{ cucina_request.id if cucina_request else '' }}">
+    <input type="hidden" name="date" value="{{ date_filter }}">
+    <button class="btn btn-outline-danger">
+      <i class="bi bi-trash me-1"></i>Elimina giacenza
+    </button>
+  </form>
+</div>
+
+<style>
+  .table-center-qty th, .table-center-qty td { vertical-align: middle; }
+  .col-qty { width:110px; }
+  .group-chip{
+    display:inline-block;
+    padding:.35rem .7rem;
+    border-radius:999px;
+    background:#f7f8fa;
+    border:1px solid var(--border);
+    box-shadow: 0 4px 14px rgba(0,0,0,.06) inset, 0 6px 16px rgba(0,0,0,.04);
+    font-weight:700;
+  }
+</style>
+{% endblock %}
