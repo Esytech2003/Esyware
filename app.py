@@ -23,17 +23,22 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret")
 
 # Usa Postgres in produzione se è impostata DATABASE_URL, altrimenti SQLite locale
-DB_URL = os.environ.get("DATABASE_URL")
+DB_URL = (os.environ.get("DATABASE_URL") or "").strip()
+
 if DB_URL:
-    # Normalizza eventuale prefisso postgres://
+    # Normalizza prefissi per SQLAlchemy + psycopg3
     if DB_URL.startswith("postgres://"):
         DB_URL = DB_URL.replace("postgres://", "postgresql+psycopg://", 1)
     elif DB_URL.startswith("postgresql://"):
         DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    # Se stai usando la URL esterna di Render, assicurati SSL
+    if "render.com" in DB_URL and "sslmode=" not in DB_URL:
+        DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
+
     app.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
 else:
     app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
-
 
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
@@ -929,6 +934,10 @@ def allowed_macro_areas_for(user):
 @login_required
 @require_role("admin")
 def admin_grid_plan_download_suppliers(plan_id):
+    import time, tempfile
+    from flask import after_this_request
+    from weasyprint import HTML, CSS
+
     plan = DistributionPlan.query.get_or_404(plan_id)
     blocks = build_plan_hierarchy_by_supplier(plan_id)
 
@@ -936,100 +945,159 @@ def admin_grid_plan_download_suppliers(plan_id):
         flash("Nessun prodotto da caricare per questo piano.", "warning")
         return redirect(url_for("admin_grid", plan_id=plan.id))
 
-    from weasyprint import HTML, CSS
+    # --- debug: consenti taglio per test: ?limit=10
+    limit = request.args.get("limit", type=int)
+    if limit:
+        blocks = blocks[:max(1, limit)]
 
-    # CSS (stessi della stampa singola)
+    # --- CSS locali (niente fetch via HTTP)
     css_files = []
     css_main_path = os.path.join(BASE_DIR, "static", "css", "style.css")
     if os.path.exists(css_main_path):
         css_files.append(CSS(filename=css_main_path))
     css_files.append(CSS(string="@page { size: A4; margin: 16mm; }"))
 
-    # ZIP in-memory
-    zip_buffer = io.BytesIO()
-    used_names = set()
+    t_global = time.time()
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for blk in blocks:
-            supplier_name = blk["supplier_name"]
+    # --- ZIP su file temporaneo (spilla su disco, non in RAM)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp_path = tmp.name
+    tmp.close()  # verrà riaperto dallo ZipFile
 
-            html = render_template(
-                "admin/plan_print_supplier.html",
-                plan=plan,
-                clients=blk["clients"],
-                gen_dt=datetime.utcnow(),
-            )
-            pdf_bytes = HTML(string=html, base_url=BASE_DIR).write_pdf(stylesheets=css_files)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, blk in enumerate(blocks, start=1):
+                t0 = time.time()
 
-            # solo nome fornitore (sanificato) come nome file
-            base = _slug(supplier_name) or "fornitore"
-            name = f"{base}.pdf"
-            i = 2
-            while name in used_names:
-                name = f"{base}-{i}.pdf"
-                i += 1
-            used_names.add(name)
+                supplier_name = blk["supplier_name"]
+                html = render_template(
+                    "admin/plan_print_supplier.html",
+                    plan=plan,
+                    clients=blk["clients"],
+                    gen_dt=datetime.utcnow(),
+                )
 
-            zf.writestr(name, pdf_bytes)
-    zip_buffer.seek(0)
-    return send_file(   
-        zip_buffer,
-        mimetype="application/zip",
-        as_attachment=True,
-        download_name=f"recap-piano-{plan.id}-per-fornitore.zip",
-        max_age=0,
-        conditional=False,
-        etag=False,
-        last_modified=None,
-    )
+                # base_url = filesystem → niente chiamate HTTP ai /static
+                pdf_bytes = HTML(string=html, base_url=BASE_DIR).write_pdf(stylesheets=css_files)
+
+                base = _slug(supplier_name) or "fornitore"
+                name = f"{base}.pdf"
+                # evita duplicati di nome nel .zip
+                j = 2
+                while name in zf.namelist():
+                    name = f"{base}-{j}.pdf"
+                    j += 1
+
+                zf.writestr(name, pdf_bytes)
+
+                # Log tempi e pesi
+                app.logger.info(
+                    f"[ZIP-SUP] {i}/{len(blocks)} '{supplier_name}' "
+                    f"in {time.time()-t0:.2f}s, size={len(pdf_bytes)/1024:.1f}KB"
+                )
+
+        app.logger.info(f"[ZIP-SUP] TOTAL suppliers={len(blocks)} in {time.time()-t_global:.2f}s")
+
+        # Pulisci il file tmp dopo l'invio
+        @after_this_request
+        def _cleanup(response):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            return response
+
+        return send_file(
+            tmp_path,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"recap-piano-{plan.id}-per-fornitore.zip",
+            max_age=0,
+            conditional=False,
+            etag=False,
+            last_modified=None,
+        )
+
+    except Exception as e:
+        # Se qualcosa va storto, prova a eliminare il tmp
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        app.logger.exception("Errore durante generazione ZIP fornitori")
+        flash("Errore durante la generazione dello ZIP fornitori.", "danger")
+        return redirect(url_for("admin_grid", plan_id=plan.id))
 
 
 @app.get("/admin/griglia/plan/<int:plan_id>/download")
 @login_required
 @require_role("admin")
 def admin_grid_plan_download(plan_id):
-    # 1) Costruisco i dati con lo stesso template HTML che usi a schermo
-    plan = DistributionPlan.query.get_or_404(plan_id)
-    hierarchy = build_plan_hierarchy_by_client(plan_id)
-
-    html = render_template(
-        "admin/plan_print.html",   # <-- lo stesso template usato prima
-        plan=plan,
-        hierarchy=hierarchy,
-        gen_dt=datetime.utcnow(),
-    )
-
-    # 2) Converto in PDF con WeasyPrint e lo SCARICO (attachment)
     from weasyprint import HTML, CSS
+    try:
+        # Dati per il template
+        plan = DistributionPlan.query.get_or_404(plan_id)
+        hierarchy = build_plan_hierarchy_by_client(plan_id)
 
-    css_files = []
-    # Iniettiamo anche il tuo CSS principale per mantenere lo stile
-    css_main_path = os.path.join(BASE_DIR, "static", "css", "style.css")
-    if os.path.exists(css_main_path):
-        css_files.append(CSS(filename=css_main_path))
+        html = render_template(
+            "admin/plan_print.html",
+            plan=plan,
+            hierarchy=hierarchy,
+            gen_dt=datetime.utcnow(),
+        )
 
-    # Margini pagina (A4) + eventuale tuning di stampa
-    css_files.append(CSS(string="""
-        @page { size: A4; margin: 16mm; }
-        /* Evita divider troppo scuri su stampa, se servisse
-        .table td, .table th { border-color: #ddd !important; } */
-    """))
+        # CSS: usa percorso su filesystem dell'app per style.css + regole @page
+        css_files = []
+        css_fs_path = os.path.join(app.root_path, "static", "css", "style.css")
+        if os.path.exists(css_fs_path):
+            css_files.append(CSS(filename=css_fs_path))
+        css_files.append(CSS(string="@page { size: A4; margin: 16mm; }"))
 
-    # base_url IMPORTANTISSIMO per risolvere url relativi/icone/font
-    pdf_bytes = HTML(string=html, base_url=BASE_DIR).write_pdf(stylesheets=css_files)
+        # IMPORTANTISSIMO: base_url come URL assoluto dell'app,
+        # così /static/... viene risolto correttamente da WeasyPrint
+        pdf_bytes = HTML(
+            string=html,
+            base_url=request.url_root
+        ).write_pdf(stylesheets=css_files)
 
-    return send_file(
-        io.BytesIO(pdf_bytes),
-        mimetype="application/pdf",
-        as_attachment=True,  # <-- forza download
-        download_name=f"recap-piano-{plan.id}.pdf",
-        max_age=0,
-        conditional=False,
-        etag=False,
-        last_modified=None,
-    )
-
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"recap-piano-{plan.id}.pdf",
+            max_age=0,
+            conditional=False,
+            etag=False,
+            last_modified=None,
+        )
+    except Exception:
+        app.logger.exception("Errore generazione PDF per plan_id=%s", plan_id)
+        return "Errore nella generazione del PDF", 500
 # ---------- ROUTES COMUNI ----------
+
+from flask import Response
+
+@app.get("/_pdf_test")
+def _pdf_test():
+    from weasyprint import HTML
+    html = f"""
+    <html>
+      <body>
+        <h1>PDF OK</h1>
+        <p>Base URL: {request.url_root}</p>
+        <img src="{ url_for('static', filename='img/logo.png', _external=True) }" style="height:48px">
+        <style>
+          @page {{ size: A4; margin: 16mm; }}
+          body {{ font-family: sans-serif; }}
+          h1 {{ margin: 0 0 8px 0; }}
+        </style>
+      </body>
+    </html>
+    """
+    pdf = HTML(string=html, base_url=request.url_root).write_pdf()
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition":"inline; filename=test.pdf"})
+
 
 @app.route("/")
 @login_required

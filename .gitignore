@@ -28,3 +28,7 @@ app.db
 
 *.pdf
 *.zip
+
+# DB locali
+*.db
+esyware_db

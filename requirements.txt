@@ -4,6 +4,7 @@ Flask-SQLAlchemy==3.1.1
 SQLAlchemy==2.0.32
 python-dateutil==2.9.0.post0
 psycopg[binary]==3.2.10     # <-- aggiornato
-WeasyPrint==61.0
+WeasyPrint==59.0
+pydyf==0.10.0
 gunicorn==21.2.0
 backports.zoneinfo==0.2.1; python_version < "3.9"
