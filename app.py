@@ -2346,9 +2346,18 @@ def admin_delete_product(prod_id):
     if is_partial_admin():
         flash("Non autorizzato: questo account admin non può eliminare prodotti.", "danger")
         return redirect(url_for("admin_products"))
+
     p = Product.query.get_or_404(prod_id)
+
+    # 1) elimina tutte le righe figlie che referenziano il prodotto
+    RequestItem.query.filter_by(product_id=p.id).delete(synchronize_session=False)
+    DistributionLine.query.filter_by(product_id=p.id).delete(synchronize_session=False)
+    ClientProductRecommendation.query.filter_by(product_id=p.id).delete(synchronize_session=False)
+
+    # 2) elimina il prodotto
     db.session.delete(p)
     db.session.commit()
+
     flash("Prodotto eliminato.", "success")
     return redirect(url_for("admin_products"))
 
