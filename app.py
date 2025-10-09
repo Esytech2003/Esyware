@@ -252,8 +252,8 @@ def ensure_schema_upgrade():
 
     try:
         if db.engine.name.startswith("postgresql"):
-            cols = {c["name"]: c for c in insp.get_columns("request_items")}
-            col = cols.get("qty_requested")
+            cols_req_it = {c["name"]: c for c in insp.get_columns("request_items")}
+            col = cols_req_it.get("qty_requested")
             if col and "numeric" not in str(col.get("type", "")).lower():
                 with db.engine.begin() as conn:
                     conn.execute(text("""
@@ -270,42 +270,61 @@ def ensure_schema_upgrade():
         with db.engine.begin() as conn:
             conn.execute(text("ALTER TABLE requests ADD COLUMN submitted_by_user_id INTEGER"))
 
-    # --- NEW: su Postgres ricrea TUTTI i FK che puntano a products(id) con ON DELETE CASCADE ---
-    try:
-        if "postgres" in (db.engine.name or "").lower():
-            with db.engine.begin() as conn:
-                conn.execute(text("""
-                DO $$
-                DECLARE
-                  r record;
-                BEGIN
-                  FOR r IN
-                    SELECT
-                      c.conname,
-                      c.conrelid::regclass AS child_table,
-                      c.confrelid::regclass AS parent_table,
-                      (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
-                         FROM unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord)
-                         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) AS child_columns,
-                      (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
-                         FROM unnest(c.confkey) WITH ORDINALITY AS u(attnum, ord)
-                         JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = u.attnum) AS parent_columns
-                    FROM pg_constraint c
-                    WHERE c.contype = 'f'
-                      AND c.confrelid = 'products'::regclass
-                  LOOP
-                    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.child_table, r.conname);
-                    EXECUTE format(
-                      'ALTER TABLE %s ADD CONSTRAINT %I FOREIGN KEY (%s) REFERENCES %s (%s) ON DELETE CASCADE',
-                      r.child_table, r.conname, r.child_columns, r.parent_table, r.parent_columns
-                    );
-                  END LOOP;
-                END $$;
-                """))
-    except Exception:
-        # non bloccare l’avvio
-        pass
+    # --- NEW: su Postgres, imposta ON DELETE CASCADE su QUALSIASI FK che punta a products(id)
+    if "postgres" in (db.engine.name or "").lower():
+        with db.engine.begin() as conn:
+            # Generic: trova tutte le FK che referenziano products e ricreale con CASCADE
+            conn.execute(text("""
+            DO $$
+            DECLARE
+              r record;
+              child_cols text;
+              parent_cols text;
+            BEGIN
+              FOR r IN
+                SELECT
+                  c.conname,
+                  c.conrelid::regclass AS child_table,
+                  c.confrelid::regclass AS parent_table
+                FROM pg_constraint c
+                WHERE c.contype = 'f'
+                  AND c.confrelid = 'products'::regclass
+              LOOP
+                -- colonne figlio
+                SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
+                  INTO child_cols
+                FROM unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord)
+                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
+                WHERE c.conname = r.conname;
 
+                -- colonne padre
+                SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
+                  INTO parent_cols
+                FROM unnest((SELECT c2.confkey FROM pg_constraint c2 WHERE c2.conname = r.conname)) WITH ORDINALITY AS u(attnum, ord)
+                JOIN pg_attribute a ON a.attrelid = r.parent_table::regclass AND a.attnum = u.attnum;
+
+                EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.child_table, r.conname);
+                EXECUTE format(
+                  'ALTER TABLE %s ADD CONSTRAINT %I FOREIGN KEY (%s) REFERENCES %s (%s) ON DELETE CASCADE',
+                  r.child_table, r.conname, child_cols, r.parent_table, parent_cols
+                );
+              END LOOP;
+            END $$;
+            """))
+
+# Esegui la patch schema una sola volta per worker (anche con Gunicorn)
+_SCHEMA_PATCHED = False
+
+@app.before_request
+def _run_schema_patch_once():
+    global _SCHEMA_PATCHED
+    if not _SCHEMA_PATCHED:
+        try:
+            ensure_schema_upgrade()
+            app.logger.info("ensure_schema_upgrade eseguita.")
+        except Exception:
+            app.logger.exception("ensure_schema_upgrade: errore")
+        _SCHEMA_PATCHED = True
 
 def get_or_create_draft_request(client_id: int) -> RequestHeader:
     draft = RequestHeader.query.filter_by(client_id=client_id, status="bozza").order_by(RequestHeader.created_at.desc()).first()
@@ -2327,13 +2346,11 @@ def admin_delete_product(prod_id):
     if is_partial_admin():
         flash("Non autorizzato: questo account admin non può eliminare prodotti.", "danger")
         return redirect(url_for("admin_products"))
-
     p = Product.query.get_or_404(prod_id)
-    db.session.delete(p)   # <-- basta questo
+    db.session.delete(p)
     db.session.commit()
     flash("Prodotto eliminato.", "success")
     return redirect(url_for("admin_products"))
-
 
 @app.post("/admin/clients/<int:client_id>/delete")
 @login_required
