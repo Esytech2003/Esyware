@@ -31,7 +31,13 @@
 <!-- Riquadro con tabella e salvataggio -->
 <div class="card shadow-sm">
   <div class="card-body">
-    <form method="post">
+
+    <!-- Banner errori globale (mostrato solo se ci sono errori) -->
+    <div id="qty-errors" class="alert alert-danger d-none" role="alert">
+      Compila tutte le quantità con un numero ≥ 0 (inserisci 0 se non serve).
+    </div>
+
+    <form method="post" id="qty-form" novalidate>
       <div class="table-responsive">
         <table class="table table-sm align-middle table-fixed w-100">
           <colgroup>
@@ -49,6 +55,7 @@
           <tbody>
             {% for p in products %}
               {% set it = qty_map.get(p.id) %}
+              {% set v = it.qty_requested|fmt_qty if it else '0' %}
               <tr>
                 <td>{{ p.name }}</td>
                 <td class="text-end">
@@ -60,8 +67,13 @@
                     pattern="[0-9]+([,\.][0-9]{1,3})?"
                     class="form-control form-control-sm rounded-4 text-end"
                     name="qty_{{ p.id }}"
-                    value="{{ it.qty_requested|fmt_qty if it else '0' }}"
+                    placeholder="0"
+                    value="{{ '' if v == '0' else v }}"
+                    aria-invalid="false"
                   >
+                  <div class="invalid-feedback text-end">
+                    Inserisci una quantità valida (≥ 0). Metti <strong>0</strong> se non serve.
+                  </div>
                 </td>
                 <td class="ps-4 border-start">
                   <input
@@ -96,13 +108,65 @@
 </style>
 
 <script>
-document.addEventListener('submit', function (e) {
-  const form = e.target.closest('form');
+(function () {
+  // Trova il form POST delle quantità (fallback nel caso cambi l'id)
+  let form = document.getElementById('qty-form');
+  if (!form) {
+    const candidates = Array.from(document.querySelectorAll('form[method="post"]'));
+    form = candidates.find(f => f.querySelector('input[name^="qty_"]')) || null;
+  }
   if (!form) return;
-  form.querySelectorAll('input[name^="qty_"]').forEach(inp => {
-    if (typeof inp.value === 'string') {
-      inp.value = inp.value.replace(',', '.'); // normalizza 0,5 -> 0.5
+  form.setAttribute('novalidate', '');
+
+  const banner = document.getElementById('qty-errors');
+  const qtySelector = 'input[name^="qty_"]';
+  const qtyInputs = Array.from(form.querySelectorAll(qtySelector));
+
+  // UX: al focus seleziona tutto; se un campo è "0" iniziale, svuotalo per usare il placeholder
+  qtyInputs.forEach(inp => {
+    if (inp.value.trim() === '0') inp.value = '';
+    inp.addEventListener('focus', () => setTimeout(() => inp.select(), 0));
+    inp.addEventListener('input', () => {
+      // normalizza virgole e pulisce errori mentre digiti
+      inp.value = inp.value.replace(',', '.');
+      inp.classList.remove('is-invalid');
+      inp.setAttribute('aria-invalid', 'false');
+      if (banner) banner.classList.add('d-none');
+    });
+  });
+
+  form.addEventListener('submit', function (e) {
+    let firstInvalid = null;
+
+    qtyInputs.forEach(inp => {
+      // normalizza 0,5 -> 0.5
+      inp.value = (inp.value || '').replace(',', '.');
+      const raw = (inp.value || '').trim();
+
+      let invalid = false;
+      if (raw === '') {
+        invalid = true; // obbligatorio
+      } else {
+        const n = Number(raw);
+        if (Number.isNaN(n) || n < 0) invalid = true; // numero >= 0
+      }
+
+      if (invalid) {
+        inp.classList.add('is-invalid');
+        inp.setAttribute('aria-invalid', 'true');
+        if (!firstInvalid) firstInvalid = inp;
+      } else {
+        inp.classList.remove('is-invalid');
+        inp.setAttribute('aria-invalid', 'false');
+      }
+    });
+
+    if (firstInvalid) {
+      e.preventDefault(); // blocca invio
+      if (banner) banner.classList.remove('d-none');
+      firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      firstInvalid.focus({ preventScroll: true });
     }
   });
-});
+})();
 </script>
