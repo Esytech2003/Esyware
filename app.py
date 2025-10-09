@@ -74,20 +74,30 @@ class Department(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False, unique=True)
     active = db.Column(db.Boolean, default=True)
-    macro_area = db.Column(db.String(20), nullable=False, default="sala")  # 'sala' | 'cucina'
-
+    macro_area = db.Column(db.String(20), nullable=False, default="sala")
     products = db.relationship("Product", back_populates="department", lazy=True)
 
 class Product(db.Model):
     __tablename__ = "products"
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(180), nullable=False)
-    # sku rimosso dall'UI: il campo può esistere nel DB ma non viene usato
     sku = db.Column(db.String(80), nullable=True)
     active = db.Column(db.Boolean, default=True)
 
     department_id = db.Column(db.Integer, db.ForeignKey("departments.id"), nullable=False)
     department = db.relationship("Department", back_populates="products")
+
+    # NEW: relazioni passive (lascia il DB fare la cascata)
+    request_items = db.relationship(
+        "RequestItem",
+        back_populates="product",
+        passive_deletes=True,
+    )
+    distribution_lines = db.relationship(
+        "DistributionLine",
+        back_populates="product",
+        passive_deletes=True,
+    )
 
 class RequestHeader(db.Model):
     __tablename__ = "requests"
@@ -106,11 +116,11 @@ class RequestItem(db.Model):
     __tablename__ = "request_items"
     id = db.Column(db.Integer, primary_key=True)
     request_id = db.Column(db.Integer, db.ForeignKey("requests.id"), nullable=False)
-    product_id = db.Column(db.Integer, db.ForeignKey("products.id"), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     note = db.Column(db.String(255), nullable=True)
 
     request = db.relationship("RequestHeader", back_populates="items")
-    product = db.relationship("Product")
+    product = db.relationship("Product", back_populates="request_items")
     qty_requested = db.Column(db.Numeric(10,3), nullable=False, default=0)
 
 class DistributionPlan(db.Model):
@@ -127,7 +137,7 @@ class ClientProductRecommendation(db.Model):
     __tablename__ = "client_product_recommendations"
     id = db.Column(db.Integer, primary_key=True)
     client_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    product_id = db.Column(db.Integer, db.ForeignKey("products.id"), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
     recommended_qty = db.Column(db.Integer, nullable=False, default=0)
 
     __table_args__ = (
@@ -141,14 +151,14 @@ class DistributionLine(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     plan_id = db.Column(db.Integer, db.ForeignKey("distribution_plans.id"), nullable=False)
     client_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    product_id = db.Column(db.Integer, db.ForeignKey("products.id"), nullable=False)
-    # CAMBIA QUI: Numeric fixed point 2 decimali
+    product_id = db.Column(db.Integer, db.ForeignKey("products.id", ondelete="CASCADE"), nullable=False)
+
     qty_in  = db.Column(db.Numeric(10,3), nullable=False, default=0)
     qty_out = db.Column(db.Numeric(10,3), nullable=False, default=0)
 
     plan = db.relationship("DistributionPlan", back_populates="lines")
     client = db.relationship("User")
-    product = db.relationship("Product")
+    product = db.relationship("Product", back_populates="distribution_lines")
 
 class MacroAreaAccess(db.Model):
     __tablename__ = "macro_area_access"
@@ -231,19 +241,19 @@ from sqlalchemy import inspect, text
 
 def ensure_schema_upgrade():
     insp = inspect(db.engine)
+
+    # --- tue patch preesistenti ---
     cols = {c["name"] for c in insp.get_columns("users")}
     if "admin_level" not in cols:
-        # Aggiungi la colonna con default 'full' (compatibile con SQLite e Postgres)
         with db.engine.begin() as conn:
             conn.execute(text("ALTER TABLE users ADD COLUMN admin_level VARCHAR(20) DEFAULT 'full'"))
-            # backfill: admin -> full, altri -> none (o lasciali default)
             conn.execute(text("UPDATE users SET admin_level='full' WHERE role='admin'"))
             conn.execute(text("UPDATE users SET admin_level='none' WHERE role!='admin'"))
+
     try:
         if db.engine.name.startswith("postgresql"):
             cols = {c["name"]: c for c in insp.get_columns("request_items")}
             col = cols.get("qty_requested")
-            # se la colonna non è già numeric, la trasformo
             if col and "numeric" not in str(col.get("type", "")).lower():
                 with db.engine.begin() as conn:
                     conn.execute(text("""
@@ -252,14 +262,50 @@ def ensure_schema_upgrade():
                         TYPE NUMERIC(10,3)
                         USING qty_requested::numeric
                     """))
-    except Exception as _e:
-        # logga se vuoi, ma non bloccare l’avvio
+    except Exception:
         pass
 
     cols_req = {c["name"] for c in insp.get_columns("requests")}
     if "submitted_by_user_id" not in cols_req:
         with db.engine.begin() as conn:
             conn.execute(text("ALTER TABLE requests ADD COLUMN submitted_by_user_id INTEGER"))
+
+    # --- NEW: su Postgres ricrea TUTTI i FK che puntano a products(id) con ON DELETE CASCADE ---
+    try:
+        if "postgres" in (db.engine.name or "").lower():
+            with db.engine.begin() as conn:
+                conn.execute(text("""
+                DO $$
+                DECLARE
+                  r record;
+                BEGIN
+                  FOR r IN
+                    SELECT
+                      c.conname,
+                      c.conrelid::regclass AS child_table,
+                      c.confrelid::regclass AS parent_table,
+                      (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
+                         FROM unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord)
+                         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum) AS child_columns,
+                      (SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
+                         FROM unnest(c.confkey) WITH ORDINALITY AS u(attnum, ord)
+                         JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = u.attnum) AS parent_columns
+                    FROM pg_constraint c
+                    WHERE c.contype = 'f'
+                      AND c.confrelid = 'products'::regclass
+                  LOOP
+                    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.child_table, r.conname);
+                    EXECUTE format(
+                      'ALTER TABLE %s ADD CONSTRAINT %I FOREIGN KEY (%s) REFERENCES %s (%s) ON DELETE CASCADE',
+                      r.child_table, r.conname, r.child_columns, r.parent_table, r.parent_columns
+                    );
+                  END LOOP;
+                END $$;
+                """))
+    except Exception:
+        # non bloccare l’avvio
+        pass
+
 
 def get_or_create_draft_request(client_id: int) -> RequestHeader:
     draft = RequestHeader.query.filter_by(client_id=client_id, status="bozza").order_by(RequestHeader.created_at.desc()).first()
@@ -2281,12 +2327,9 @@ def admin_delete_product(prod_id):
     if is_partial_admin():
         flash("Non autorizzato: questo account admin non può eliminare prodotti.", "danger")
         return redirect(url_for("admin_products"))
+
     p = Product.query.get_or_404(prod_id)
-    # rimuove eventuali righe richiesta collegate a questo prodotto
-    RequestItem.query.filter_by(product_id=p.id).delete(synchronize_session=False)
-    # ✱✱ NUOVO: rimuovi anche le righe dei piani di distribuzione collegate ✱✱
-    DistributionLine.query.filter_by(product_id=p.id).delete(synchronize_session=False)
-    db.session.delete(p)
+    db.session.delete(p)   # <-- basta questo
     db.session.commit()
     flash("Prodotto eliminato.", "success")
     return redirect(url_for("admin_products"))
