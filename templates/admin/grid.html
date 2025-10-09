@@ -201,13 +201,14 @@
 
               {# 4) Da Caricare #}
               <td>
+                {% set v_in = (plan_map.get((c.id, p.id), {}).get('in', 0) | fmt_qty) %}
                 <input type="text" inputmode="decimal"
-                  class="form-control form-control-sm grid-input input-in text-end"
-                  name="in_{{ c.id }}_{{ p.id }}"
-                  value="{{ plan_map.get((c.id, p.id), {}).get('in', 0)|fmt_qty }}"
-                  data-pair="c{{c.id}}p{{p.id}}" data-kind="in" data-touched="0"
-                  placeholder="0" {{ 'disabled' if read_only else '' }}>
-                </td>
+                      class="form-control form-control-sm grid-input input-in text-end"
+                      name="in_{{ c.id }}_{{ p.id }}"
+                      value="{{ '' if v_in == '0' else v_in }}"
+                      data-pair="c{{c.id}}p{{p.id}}" data-kind="in" data-touched="0"
+                      placeholder="0" {{ 'disabled' if read_only else '' }}>
+              </td>
 
               {# 5) Da Togliere (DISABILITATO) #}
               {#
