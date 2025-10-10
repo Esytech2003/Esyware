@@ -597,6 +597,47 @@
 
   // Prima pittura dei puntini
   paintStatusDots();
+
+
+  // ====== MOBILE: colonna "Prodotto" larga quanto il nome più lungo (con limiti) ======
+  function computeProdColWidthMobile(){
+    if (!window.matchMedia('(max-width: 576px)').matches) return;
+
+    const names = Array.from(document.querySelectorAll('.product-cell .prod-name'));
+    if (!names.length) return;
+
+    // prendi la larghezza "intrinseca" necessaria (senza andare a capo)
+    let maxNameWidth = 0;
+    names.forEach(el => {
+      // scrollWidth tiene conto del contenuto intero
+      const w = Math.ceil(el.scrollWidth);
+      if (w > maxNameWidth) maxNameWidth = w;
+    });
+
+    // padding/aria della cella
+    const extraPadding = 28; // circa padding + bordo sinistro sticky
+    let target = maxNameWidth + extraPadding;
+
+    // Limiti: non meno di 120px e non più del 55% della viewport
+    const MIN = 120;
+    const MAX = Math.floor(window.innerWidth * 0.55);
+    target = Math.max(MIN, Math.min(target, MAX));
+
+    // applica alla root: usata nel CSS sopra
+    document.documentElement.style.setProperty('--prod-col-w', `${target}px`);
+  }
+
+  // calcolo iniziale + ricalcolo su resize/orientamento (debounced)
+  let _cwTimer;
+  function recomputeProdColWidthDebounced(){
+    clearTimeout(_cwTimer);
+    _cwTimer = setTimeout(computeProdColWidthMobile, 100);
+  }
+
+  window.addEventListener('DOMContentLoaded', computeProdColWidthMobile);
+  window.addEventListener('resize', recomputeProdColWidthDebounced);
+  window.addEventListener('orientationchange', recomputeProdColWidthDebounced);
+
 })();
 </script>
 
@@ -730,12 +771,15 @@
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
 
-/* recap precedenti (barra sticky) */
+/* recap precedenti (barra NON sticky: scorre con la pagina) */
 .prev-filter-bar{
-  position:sticky; top:64px; z-index:20;
-  background:#fff; padding:6px 0;
+  position: static;     /* ← niente sticky */
+  top: auto;
+  z-index: auto;
+  background:#fff;
+  padding:6px 0;
   border-bottom:1px solid var(--border);
-  box-shadow:0 2px 10px rgba(0,0,0,.04);
+  box-shadow:none;      /* opzionale: rimuove l’ombra da barra “fissa” */
 }
 
 /* badge consigliata/da aggiungere */
@@ -786,5 +830,23 @@
 /* colonna “dettaglio per negozio” più ariosa */
 .col-details{ padding-left:32px !important; border-left:none !important; }
 @media (min-width:1200px){ .col-details{ padding-left:75px !important; } }
+
+/* ===== Mobile: larghezza colonna "Prodotto" dinamica sul nome più lungo ===== */
+@media (max-width: 576px){
+  /* usa una variabile CSS calcolata da JS; fallback 160px */
+  .table-grid col:first-child{
+    width: var(--prod-col-w, 160px) !important;
+  }
+  .table-grid .sticky-col{
+    min-width: var(--prod-col-w, 160px) !important;
+    max-width: var(--prod-col-w, 160px) !important;
+  }
+  /* evita che il testo sbordi oltre la colonna calcolata */
+  .product-cell .prod-name{
+    max-width: calc(var(--prod-col-w, 160px) - 24px);
+  }
+}
+
+
 </style>
 {% endblock %}

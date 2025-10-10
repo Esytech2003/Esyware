@@ -1376,20 +1376,40 @@ def client_review():
         if a not in grouped_macro_sorted:
             grouped_macro_sorted[a] = sort_blocks(grouped[a])
 
+    
+
     if request.method == "POST":
         if len(items) == 0:
             flash("Aggiungi almeno una quantità prima di inviare.", "warning")
             return redirect(url_for("client_departments"))
 
+        # --- giorno locale Europe/Rome per l'overwrite ---
+        today_ymd = (datetime.now(TZ_ROME).date() if TZ_ROME else datetime.utcnow().date()).strftime("%Y-%m-%d")
+        start_utc, end_utc = local_day_range_utc(today_ymd)
+
+        # 1) elimina TUTTE le 'inviata' di quel negozio in quel giorno
+        existing = (
+            RequestHeader.query
+            .filter_by(client_id=client_id_for_work, status="inviata")
+            .filter(RequestHeader.created_at >= start_utc)
+            .filter(RequestHeader.created_at <  end_utc)
+            .all()
+        )
+        for rh in existing:
+            db.session.delete(rh)
+
+        # 2) finalizza la bozza come "inviata"
         draft.created_at = datetime.utcnow()
         draft.status = "inviata"
-        # 👇 salva chi l'ha inviata
         draft.submitted_by_user_id = current_user.id
 
         db.session.commit()
 
         flash("Giacenza inviata al magazzino!", "success")
         return redirect(url_for("client_departments"))
+
+
+
 
     # GET → mostra pagina
     return render_template(
@@ -1400,7 +1420,38 @@ def client_review():
     )
 
 
+@app.cli.command("cleanup-inviate-duplicate-days")
+def cleanup_inviate_duplicate_days():
+    """
+    Per ogni (client_id, giorno locale) con più di una 'inviata',
+    conserva solo la più recente ed elimina le altre.
+    """
+    from collections import defaultdict
 
+    all_sent = (
+        RequestHeader.query
+        .filter_by(status="inviata")
+        .order_by(RequestHeader.client_id.asc(), RequestHeader.created_at.asc())
+        .all()
+    )
+
+    buckets = defaultdict(list)  # (client_id, yyyymmdd) -> [RequestHeader...]
+    for rh in all_sent:
+        ymd = _local_ymd(rh.created_at)  # usa già Europe/Rome
+        buckets[(rh.client_id, ymd)].append(rh)
+
+    to_delete = []
+    for (_, _ymd), lst in buckets.items():
+        if len(lst) <= 1:
+            continue
+        # tieni solo la più recente
+        lst.sort(key=lambda r: r.created_at)
+        to_delete.extend(lst[:-1])
+
+    for rh in to_delete:
+        db.session.delete(rh)
+    db.session.commit()
+    print(f"Pulite {len(to_delete)} giacenze duplicate (tenuta solo la più recente per giorno).")
 
 def _draft_filled_rows_count_for_current_employee() -> int:
     """
@@ -1465,12 +1516,27 @@ def admin_dashboard():
             # completo solo se ho sia sala che cucina nel pair
             is_complete = required_areas.issubset(present_areas)
 
+            # ... dentro il for p in pairs: (subito dopo aver calcolato present_areas / required_areas)
+            submitter_names = []
+            for area, block in (p.get("areas") or {}).items():
+                submitter_id = block.get("submitter_id")
+                if submitter_id:
+                    u = User.query.get(submitter_id)
+                    if u:
+                        label = (u.display_name or u.username or f"#{u.id}")
+                        if label not in submitter_names:
+                            submitter_names.append(label)
+
+            submitter_name = ", ".join(submitter_names) if submitter_names else "—"
+
+
             rows.append({
                 "client_id": c.id,
                 "client_name": c.display_name or c.username,
                 "rank": p["rank"],
                 "created_at": p["created_at"],
                 "is_complete": is_complete,  # <-- boolean garantito
+                "submitter_name": submitter_name,
             })
 
     rows.sort(key=lambda r: (r["created_at"] or datetime.min), reverse=True)
@@ -2220,25 +2286,46 @@ def admin_departments():
     )
 
 
-
 @app.route("/admin/prodotti", methods=["GET", "POST"])
 @login_required
 @require_role("admin")
 def admin_products():
     departments = Department.query.order_by(Department.name).all()
+
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         dep_id = request.form.get("department_id")
         if not (name and dep_id):
             flash("Nome e reparto sono obbligatori.", "danger")
         else:
-            p = Product(name=name, department_id=int(dep_id), active=True)  # niente SKU
+            p = Product(name=name, department_id=int(dep_id), active=True)
             db.session.add(p)
             db.session.commit()
             flash("Prodotto creato.", "success")
+        # dopo il POST torna alla lista senza query-string
         return redirect(url_for("admin_products"))
-    products = Product.query.order_by(Product.name).all()
-    return render_template("admin/products.html", products=products, departments=departments)
+
+    # --- GET con filtro q ---
+    q = (request.args.get("q") or "").strip()
+    base = (
+        Product.query
+        .join(Department, Product.department_id == Department.id)
+        .options(joinedload(Product.department))
+        .order_by(Department.name.asc(), Product.name.asc())
+    )
+    if q:
+        base = base.filter(func.lower(Product.name).like(f"%{q.lower()}%"))
+
+    products = base.all()
+
+    return render_template(
+        "admin/products.html",
+        products=products,
+        departments=departments,
+        q=q,  # <- per tenere il valore nell’input della search
+    )
+
+
 
 # --- UPDATE endpoints: client, reparti, prodotti -----------------------------
 
@@ -2821,7 +2908,8 @@ def admin_grid():
     )
     latest_confirmed_recap = build_recap(latest_confirmed.id) if latest_confirmed else []
 
-    # Filtri data (per recap multipli sotto)
+    from datetime import datetime, time, timedelta
+
     from_str = request.args.get("from", "").strip()
     to_str   = request.args.get("to", "").strip()
 
@@ -2842,12 +2930,27 @@ def admin_grid():
     filtered_recaps = {}
     if date_from or date_to:
         q = DistributionPlan.query.filter(DistributionPlan.status == "confermato")
-        if date_from:
-            q = q.filter(func.date(DistributionPlan.created_at) >= date_from.strftime("%Y-%m-%d"))
-        if date_to:
-            q = q.filter(func.date(DistributionPlan.created_at) <= date_to.strftime("%Y-%m-%d"))
+
+        if date_from and date_to:
+            start_dt = datetime.combine(date_from, time.min)  # 00:00:00
+            end_dt   = datetime.combine(date_to + timedelta(days=1), time.min)  # esclusivo
+            q = q.filter(
+                DistributionPlan.created_at >= start_dt,
+                DistributionPlan.created_at <  end_dt
+            )
+        elif date_from:
+            start_dt = datetime.combine(date_from, time.min)
+            q = q.filter(DistributionPlan.created_at >= start_dt)
+        elif date_to:
+            end_dt = datetime.combine(date_to + timedelta(days=1), time.min)
+            q = q.filter(DistributionPlan.created_at < end_dt)
+
         filtered_plans = q.order_by(DistributionPlan.created_at.desc()).limit(200).all()
         filtered_recaps = {pl.id: build_recap(pl.id) for pl in filtered_plans}
+
+
+
+
 
     return render_template(
         "admin/grid.html",

@@ -37,7 +37,7 @@
       Compila tutte le quantità con un numero ≥ 0 (inserisci 0 se non serve).
     </div>
 
-    <form method="post" id="qty-form" novalidate>
+    <form method="post" id="qty-form">
       <div class="table-responsive">
         <table class="table table-sm align-middle table-fixed w-100">
           <colgroup>
@@ -65,11 +65,12 @@
                     step="0.001"
                     inputmode="decimal"
                     pattern="[0-9]+([,\.][0-9]{1,3})?"
-                    class="form-control form-control-sm rounded-4 text-end"
+                    class="form-control form-control-sm rounded-4 text-end qty-input"
                     name="qty_{{ p.id }}"
                     placeholder="0"
                     value="{{ '' if v == '0' else v }}"
                     aria-invalid="false"
+                    required
                   >
                   <div class="invalid-feedback text-end">
                     Inserisci una quantità valida (≥ 0). Metti <strong>0</strong> se non serve.
@@ -109,63 +110,71 @@
 
 <script>
 (function () {
-  // Trova il form POST delle quantità (fallback nel caso cambi l'id)
-  let form = document.getElementById('qty-form');
-  if (!form) {
-    const candidates = Array.from(document.querySelectorAll('form[method="post"]'));
-    form = candidates.find(f => f.querySelector('input[name^="qty_"]')) || null;
-  }
+  const form = document.getElementById('qty-form');
   if (!form) return;
-  form.setAttribute('novalidate', '');
 
   const banner = document.getElementById('qty-errors');
-  const qtySelector = 'input[name^="qty_"]';
-  const qtyInputs = Array.from(form.querySelectorAll(qtySelector));
+  const qtyInputs = Array.from(form.querySelectorAll('.qty-input'));
 
-  // UX: al focus seleziona tutto; se un campo è "0" iniziale, svuotalo per usare il placeholder
+  // UX: normalizza live e rimuove lo stato di errore
   qtyInputs.forEach(inp => {
-    if (inp.value.trim() === '0') inp.value = '';
-    inp.addEventListener('focus', () => setTimeout(() => inp.select(), 0));
+    // se iniziale "0", lascio "0" visibile: l'utente può confermare o cambiare
     inp.addEventListener('input', () => {
-      // normalizza virgole e pulisce errori mentre digiti
-      inp.value = inp.value.replace(',', '.');
+      // 1) normalizza virgola in punto
+      if (inp.value.includes(',')) inp.value = inp.value.replace(',', '.');
+
+      // 2) pulizia stato errore
       inp.classList.remove('is-invalid');
       inp.setAttribute('aria-invalid', 'false');
       if (banner) banner.classList.add('d-none');
+      // 3) azzera eventuale custom validity
+      inp.setCustomValidity('');
     });
+
+    // Messaggio nativo personalizzato se vuoto
+    inp.addEventListener('invalid', () => {
+      if (inp.validity.valueMissing) {
+        inp.setCustomValidity('Campo obbligatorio: inserisci un numero ≥ 0 (usa 0 se non serve).');
+      } else if (inp.validity.rangeUnderflow) {
+        inp.setCustomValidity('Il valore non può essere negativo.');
+      } else {
+        inp.setCustomValidity('Inserisci un numero valido (usa . per i decimali).');
+      }
+    });
+
+    // Quando torna valido, rimuovi il messaggio custom
+    inp.addEventListener('change', () => inp.setCustomValidity(''));
   });
 
   form.addEventListener('submit', function (e) {
-    let firstInvalid = null;
-
+    // normalizza tutte le virgole prima della validazione
     qtyInputs.forEach(inp => {
-      // normalizza 0,5 -> 0.5
-      inp.value = (inp.value || '').replace(',', '.');
-      const raw = (inp.value || '').trim();
-
-      let invalid = false;
-      if (raw === '') {
-        invalid = true; // obbligatorio
-      } else {
-        const n = Number(raw);
-        if (Number.isNaN(n) || n < 0) invalid = true; // numero >= 0
-      }
-
-      if (invalid) {
-        inp.classList.add('is-invalid');
-        inp.setAttribute('aria-invalid', 'true');
-        if (!firstInvalid) firstInvalid = inp;
-      } else {
-        inp.classList.remove('is-invalid');
-        inp.setAttribute('aria-invalid', 'false');
-      }
+      if (typeof inp.value === 'string') inp.value = inp.value.replace(',', '.').trim();
     });
 
-    if (firstInvalid) {
-      e.preventDefault(); // blocca invio
+    // usa la validazione HTML5
+    if (!form.checkValidity()) {
+      e.preventDefault();
       if (banner) banner.classList.remove('d-none');
-      firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      firstInvalid.focus({ preventScroll: true });
+
+      // evidenzia gli invalid
+      let firstInvalid = null;
+      qtyInputs.forEach(inp => {
+        if (!inp.checkValidity()) {
+          inp.classList.add('is-invalid');
+          inp.setAttribute('aria-invalid', 'true');
+          if (!firstInvalid) firstInvalid = inp;
+        }
+      });
+
+      // pop-up esplicito
+      alert('Inserire un valore valido per TUTTE le quantità (≥ 0). Metti 0 se non serve.');
+
+      // focus al primo campo errato
+      if (firstInvalid) {
+        firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        firstInvalid.focus({ preventScroll: true });
+      }
     }
   });
 })();

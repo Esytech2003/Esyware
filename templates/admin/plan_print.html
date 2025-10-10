@@ -23,9 +23,7 @@
     <div class="subtle">
       Creato il {{ plan.created_at.strftime('%d/%m/%Y %H:%M') }}
       · Generato il {{ (gen_dt or plan.created_at).strftime('%d/%m/%Y %H:%M') }}
-    </div>
-    
-      {{ plan.status|capitalize }}
+      · {{ plan.status|capitalize }}
     </div>
   </div>
 
@@ -33,22 +31,19 @@
     <div class="text-muted mt-4">Nessun prodotto da caricare.</div>
   {% endif %}
 
-  {% set single_client = (hierarchy|length == 1) %}
-
+  {# Mostra SEMPRE il nome del negozio #}
   {% for blk in hierarchy %}
     <div class="client-block">
-      {% if not single_client %}
-        <h2 class="client-title">
-          <i class="bi bi-shop me-1"></i>{{ blk.client.display_name if blk.client else '—' }}
-        </h2>
-      {% endif %}
+      <h2 class="client-title">
+        <i class="bi bi-shop me-1"></i>{{ blk.client.display_name if blk.client else '—' }}
+      </h2>
 
       {% for dep in blk.departments %}
         <div class="dept-block">
-          <table class="table-print">
+          <table class="table-print with-sep">
             <colgroup>
               <col>                 {# colonna Prodotto #}
-              <col class="qty-col"> {# colonna Quantità minima e destra #}
+              <col class="qty-col"> {# colonna Quantità stretta #}
             </colgroup>
             <thead>
               <tr>
@@ -78,15 +73,19 @@
   --qty-size: 1.42rem;  /* grandezza numeri quantità */
 }
 
+/* Contenitore e impostazioni base */
 .print-container{ max-width:960px; margin:0 auto; }
 @page { size:A4; margin:14mm 12mm 16mm 12mm; }
-@media print{ .navbar,.btn,.alert,.toast-stack{ display:none!important; } body{ background:#fff!important; } }
+@media print{
+  .navbar,.btn,.alert,.toast-stack{ display:none!important; }
+  body{ background:#fff!important; }
+}
 
-/* header */
+/* Header */
 .print-header h1{ margin:0 0 .25rem 0; line-height:1.15; }
 .dep-inline{ font-size:1.1em; font-weight:800; margin-left:.45rem; white-space:pre-wrap; }
 
-/* blocchi */
+/* Blocchi */
 .client-block{ page-break-inside:avoid; margin-top:16px; }
 .client-title{
   font-size:1.05rem; font-weight:700; margin:0 0 .35rem 0;
@@ -95,10 +94,10 @@
 }
 .dept-block{ margin: 6px 0 12px 0; page-break-inside:avoid; }
 
-/* tabella stile identico all’altro PDF */
+/* Tabella compatta — stile identico all’altro PDF */
 .table-print{ width:100%; border-collapse:collapse; table-layout:auto; }
 .table-print thead th{
-  font-weight:700;           /* grassetto visibile in PDF */
+  font-weight:700;
   font-size:1.05rem;
   color:#000;
   border-bottom:1.5px solid #000;
@@ -106,11 +105,13 @@
 }
 .th-qty{ text-align:right; }
 
+/* Colonna quantità stretta e non spezzata */
 .qty-col{
-  width:1%;                 /* colonna minima */
+  width:1%;
   white-space:nowrap;
 }
 
+/* Corpo tabella */
 .table-print tbody td{
   border-bottom:1px solid var(--border);
   padding:.26rem .22rem;
@@ -118,8 +119,14 @@
 }
 .table-print tr:last-child td{ border-bottom:none; }
 
+/* Celle vicine al separatore */
 .pdf-name{ padding-right:6px; }
-.pdf-qty{ padding-left:6px; text-align:right; }
+.pdf-qty{
+  padding-left:6px;
+  text-align:right;
+}
+
+/* Valore quantità grande e tabular */
 .qty-val{
   font-weight:900;
   font-size: var(--qty-size);
@@ -128,8 +135,29 @@
   color:#000;
 }
 
-/* badge colori fallback */
+/* SEPARATORE VERTICALE tra Prodotto e Q.tà (come nell’altro PDF) */
+.with-sep thead th:nth-child(2),
+.with-sep tbody td:nth-child(2){
+  border-left: 1.5px solid #000;
+}
+
+/* badge fallback */
 .bg-success{ background:#198754!important; color:#fff!important; }
 .bg-secondary{ background:#6c757d!important; color:#fff!important; }
+
+/* ——— SOLO IN STAMPA: quantità “parte dal centro” con stesso trucco ——— */
+@media print{
+  .table-print{
+    table-layout: fixed !important; /* rispetta i width fissati sotto */
+  }
+  .table-print col:first-child{
+    width: 25% !important;          /* stesso valore dell’altro PDF (assetto che ti piaceva) */
+  }
+  .table-print .th-qty,
+  .table-print .pdf-qty{
+    text-align: left !important;
+    padding-left: 8px !important;
+  }
+}
 </style>
 {% endblock %}
