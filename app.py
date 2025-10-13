@@ -347,7 +347,7 @@ def combined_client_items_for_date(client_id: int, date_str: str):
     """
     Prodotti delle giacenze 'inviata' in quel giorno (Europe/Rome), raggruppati per macro area.
     """
-    start_utc, end_utc = local_day_range_utc(date_str)
+    start_utc, end_utc = local_business_day_range_utc(date_str)
 
     reqs = (
         RequestHeader.query
@@ -533,6 +533,41 @@ def _local_ymd(dt: datetime) -> str:
         dt_local = dt
     return dt_local.strftime("%Y-%m-%d")
 
+
+# —— Business day: 04:00 → 04:00 (Europe/Rome) ——
+BUSINESS_CUTOFF_HOUR = 4  # 04:00 locali
+
+def _business_ymd(dt: datetime) -> str:
+    """
+    Ritorna la 'data' del giorno di lavoro (YYYY-MM-DD) calcolata su Europe/Rome
+    con cut-off alle 04:00. Implementazione: (dt in Rome) - 4h → .date().
+    """
+    if dt is None:
+        return ""
+    if TZ_ROME is not None:
+        dt_rome = dt.replace(tzinfo=timezone.utc).astimezone(TZ_ROME)
+    else:
+        dt_rome = dt
+    adj = dt_rome - timedelta(hours=BUSINESS_CUTOFF_HOUR)
+    return adj.strftime("%Y-%m-%d")
+
+def local_business_day_range_utc(ymd: str):
+    """
+    Per un 'giorno di lavoro' YYYY-MM-DD (inteso secondo _business_ymd),
+    ritorna l'intervallo UTC [start, end) compreso tra le 04:00 locali di quel giorno
+    e le 04:00 locali del giorno successivo.
+    """
+    day = datetime.strptime(ymd, "%Y-%m-%d").date()
+    if TZ_ROME is not None:
+        start_local = datetime(day.year, day.month, day.day, BUSINESS_CUTOFF_HOUR, 0, 0, tzinfo=TZ_ROME)
+        end_local   = start_local + timedelta(days=1)
+        start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc   = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        start_utc = datetime(day.year, day.month, day.day, BUSINESS_CUTOFF_HOUR, 0, 0)
+        end_utc   = start_utc + timedelta(days=1)
+    return start_utc, end_utc
+
 def build_request_rows_for_admin(only_date: str = None):
     """
     Ritorna la lista di righe per 'Giacenze ricevute'.
@@ -562,7 +597,7 @@ def build_request_rows_for_admin(only_date: str = None):
         # raggruppa per giorno locale
         by_day = {}  # ymd -> {"sala":[{id,created_at}], "cucina":[...]}
         for rh in reqs:
-            ymd = _local_ymd(rh.created_at)
+            _business_ymd(rh.created_at)
             if only_date and ymd != only_date:
                 continue
 
@@ -661,7 +696,7 @@ def combined_pairs_for_client_date(client_id: int, date_str: str):
     Restituisce una lista di 'pair' ordinate per tempo per quel negozio in quel giorno (Europe/Rome).
     Ogni pair contiene, per ciascuna macro-area presente, {request_id, created_at, submitter_id}.
     """
-    start_utc, end_utc = local_day_range_utc(date_str)
+    start_utc, end_utc = local_business_day_range_utc(date_str)
 
     reqs = (
         RequestHeader.query
@@ -726,7 +761,7 @@ def combined_pairs_for_client_date_any_areas(client_id: int, date_str: str):
     """
     from collections import defaultdict
 
-    start_utc, end_utc = local_day_range_utc(date_str)
+    start_utc, end_utc = local_business_day_range_utc(date_str)
 
     reqs = (
         RequestHeader.query
@@ -1481,9 +1516,10 @@ def client_review():
             flash("Aggiungi almeno una quantità prima di inviare.", "warning")
             return redirect(url_for("client_departments"))
 
-        # Giorno locale Europe/Rome per separare 23:59 e 00:10 in giorni diversi
-        today_ymd = (datetime.now(TZ_ROME).date() if TZ_ROME else datetime.utcnow().date()).strftime("%Y-%m-%d")
-        start_utc, end_utc = local_day_range_utc(today_ymd)
+        # --- Business day 04:00→04:00 per l'overwrite/merge ---
+        now_rome = datetime.now(TZ_ROME) if TZ_ROME else datetime.utcnow()
+        business_ymd = (now_rome - timedelta(hours=BUSINESS_CUTOFF_HOUR)).strftime("%Y-%m-%d")
+        start_utc, end_utc = local_business_day_range_utc(business_ymd)
 
         # Cerca se esiste già una giacenza 'inviata' oggi per questo negozio
         existing = (
@@ -1571,7 +1607,7 @@ def cleanup_inviate_duplicate_days():
 
     buckets = defaultdict(list)  # (client_id, yyyymmdd) -> [RequestHeader...]
     for rh in all_sent:
-        ymd = _local_ymd(rh.created_at)  # usa già Europe/Rome
+        ymd = _business_ymd(rh.created_at) # usa già Europe/Rome
         buckets[(rh.client_id, ymd)].append(rh)
 
     to_delete = []
@@ -1774,7 +1810,7 @@ def admin_client_pair_detail(client_id, date_str, rank):
     cucina_request = RequestHeader.query.get(cucina_req_id) if cucina_req_id else None
 
     # Prendo tutte le richieste INVIATE di quel giorno (locale Europe/Rome) per quel negozio
-    start_utc, end_utc = local_day_range_utc(date_filter)
+    start_utc, end_utc = local_business_day_range_utc(date_str)
     day_requests = (
         RequestHeader.query
         .filter_by(client_id=client_id, status="inviata")
@@ -2230,7 +2266,7 @@ def admin_requests():
     from collections import defaultdict
     ymd_by_client = defaultdict(set)
     for rh in all_reqs:
-        ymd = _local_ymd(rh.created_at)
+        ymd = _business_ymd(rh.created_at)
         ymd_by_client[rh.client_id].add(ymd)
 
     # Costruisco le "righe" (card) come la dashboard: una per (client, giorno, rank)
