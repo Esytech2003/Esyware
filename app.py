@@ -273,42 +273,40 @@ def ensure_schema_upgrade():
     # --- NEW: su Postgres, imposta ON DELETE CASCADE su QUALSIASI FK che punta a products(id)
     if "postgres" in (db.engine.name or "").lower():
         with db.engine.begin() as conn:
-            # Generic: trova tutte le FK che referenziano products e ricreale con CASCADE
             conn.execute(text("""
             DO $$
             DECLARE
               r record;
-              child_cols text;
-              parent_cols text;
             BEGIN
+              -- 1) user_macro_access.user_id -> users.id : ON DELETE CASCADE
               FOR r IN
-                SELECT
-                  c.conname,
-                  c.conrelid::regclass AS child_table,
-                  c.confrelid::regclass AS parent_table
-                FROM pg_constraint c
-                WHERE c.contype = 'f'
-                  AND c.confrelid = 'products'::regclass
+                SELECT conname
+                FROM pg_constraint
+                WHERE contype = 'f'
+                  AND confrelid = 'users'::regclass
+                  AND conrelid = 'user_macro_access'::regclass
               LOOP
-                -- colonne figlio
-                SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
-                  INTO child_cols
-                FROM unnest(c.conkey) WITH ORDINALITY AS u(attnum, ord)
-                JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = u.attnum
-                WHERE c.conname = r.conname;
-
-                -- colonne padre
-                SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY u.ord)
-                  INTO parent_cols
-                FROM unnest((SELECT c2.confkey FROM pg_constraint c2 WHERE c2.conname = r.conname)) WITH ORDINALITY AS u(attnum, ord)
-                JOIN pg_attribute a ON a.attrelid = r.parent_table::regclass AND a.attnum = u.attnum;
-
-                EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.child_table, r.conname);
-                EXECUTE format(
-                  'ALTER TABLE %s ADD CONSTRAINT %I FOREIGN KEY (%s) REFERENCES %s (%s) ON DELETE CASCADE',
-                  r.child_table, r.conname, child_cols, r.parent_table, parent_cols
-                );
+                EXECUTE format('ALTER TABLE user_macro_access DROP CONSTRAINT %I', r.conname);
               END LOOP;
+
+              ALTER TABLE user_macro_access
+                ADD CONSTRAINT user_macro_access_user_id_fkey
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+
+              -- 2) requests.submitted_by_user_id -> users.id : ON DELETE SET NULL
+              FOR r IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE contype = 'f'
+                  AND confrelid = 'users'::regclass
+                  AND conrelid = 'requests'::regclass
+              LOOP
+                EXECUTE format('ALTER TABLE requests DROP CONSTRAINT %I', r.conname);
+              END LOOP;
+
+              ALTER TABLE requests
+                ADD CONSTRAINT requests_submitted_by_user_id_fkey
+                FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE SET NULL;
             END $$;
             """))
 
@@ -2052,16 +2050,35 @@ def admin_users_delete(user_id):
     if is_partial_admin():
         flash("Non autorizzato: questo account admin non può eliminare utenti.", "danger")
         return redirect(request.referrer or url_for("admin_departments"))
+
     u = User.query.get_or_404(user_id)
-    if u.role not in ("employee","admin"):
+    if u.role not in ("employee", "admin"):
         flash("Tipo utente non eliminabile qui.", "danger")
         return redirect(request.referrer or url_for("admin_departments"))
 
-    # (eventuali cleanup come già fai)
+    # Se ADMIN: blocca se ha piani collegati (FK non nullo)
+    if u.role == "admin":
+        has_plans = db.session.query(DistributionPlan.id)\
+                     .filter_by(created_by_user_id=u.id).first()
+        if has_plans:
+            flash("Impossibile eliminare: questo admin ha piani collegati. "
+                  "Riassegna i piani a un altro admin oppure eliminali.", "danger")
+            return redirect(request.referrer or url_for("admin_departments"))
+
+    # 1) Pulisci pivot macro-aree (evita FK error)
+    UserMacroAccess.query.filter_by(user_id=u.id).delete(synchronize_session=False)
+
+    # 2) Scollega eventuali riferimenti come 'submitted_by' nelle richieste
+    RequestHeader.query.filter_by(submitted_by_user_id=u.id)\
+        .update({RequestHeader.submitted_by_user_id: None}, synchronize_session=False)
+
+    # 3) (Se fosse un client, c'è un endpoint dedicato; qui gestiamo admin/employee)
     db.session.delete(u)
     db.session.commit()
+
     flash("Account eliminato.", "success")
     return redirect(request.referrer or url_for("admin_departments"))
+
 
 @app.route("/admin/clients/<int:client_id>")
 @login_required
