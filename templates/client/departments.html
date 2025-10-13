@@ -36,6 +36,8 @@
   </div>
 </div>
 
+
+
 <h1 class="h4 mb-3">Reparti</h1>
 
 {# —— RENDER DINAMICO DI TUTTE LE MACRO-AREE CONSENTITE —— #}
@@ -95,6 +97,66 @@
   </div>
 {% endif %}
 
+{# ——— ULTIMI RIEPILOGHI (in fondo) ——— #}
+{% if history and history|length > 0 %}
+  <div class="card shadow-sm mb-4 last-history-card">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h2 class="h5 m-0 section-title">Ultimi riepiloghi inviati</h2>
+      </div>
+
+      <div class="timeline">
+        {% for h in history %}
+          <div class="timeline-item position-relative">
+            <div class="dot"></div>
+            <div class="content">
+              <div class="d-flex flex-wrap align-items-center gap-2">
+                <div class="when fw-semibold">{{ h.dt | local_dt('%d/%m/%Y %H:%M') }}</div>
+                <div class="sep">•</div>
+                <div class="rows">{{ h.rows }} {{ 'riga' if h.rows==1 else 'righe' }}</div>
+                {% if h.areas %}
+                  <div class="sep">•</div>
+                  <div class="areas d-flex flex-wrap gap-1">
+                    {% for a in h.areas %}
+                      <span class="badge area-badge">{{ a|replace('_',' ')|title }}</span>
+                    {% endfor %}
+                  </div>
+                {% endif %}
+
+                {# Desktop/tablet: bottone inline a destra #}
+                <a class="btn btn-primary ms-auto btn-open d-none d-sm-inline-flex"
+                   href="{{ url_for('client_sent_request_view', req_id=h.id) }}">
+                  Apri
+                </a>
+              </div>
+
+              {# Mobile: bottone piccolo in basso a destra #}
+              <a class="btn btn-primary btn-open-mobile d-sm-none"
+                 href="{{ url_for('client_sent_request_view', req_id=h.id) }}"
+                 aria-label="Apri riepilogo">Apri</a>
+
+              <a class="stretched-link"
+                 href="{{ url_for('client_sent_request_view', req_id=h.id) }}"
+                 aria-label="Apri riepilogo"></a>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+
+      {% if history|length == 1 %}
+        <div class="subtle small mt-2">Mostrato 1 riepilogo (non sono presenti invii precedenti).</div>
+      {% endif %}
+    </div>
+  </div>
+{% else %}
+  <div class="card shadow-sm mb-4 last-history-card">
+    <div class="card-body">
+      <h2 class="h6 m-0 subtle">Nessun riepilogo inviato di recente.</h2>
+    </div>
+  </div>
+{% endif %}
+
+
 <style>
 /* ——— LOGO & HERO ——— */
 .welcome-hero{ min-height:110px; }
@@ -148,6 +210,88 @@
   .welcome-text{ min-height:auto; }
   .welcome-right{ display:none !important; }
   .mobile-cta{ position:static; }
+}
+
+
+/* —— Timeline in fondo —— */
+.last-history-card{ margin-top: 20px; }
+
+/* Struttura timeline allineata al tema */
+.timeline{ position:relative; padding-left: 14px; }
+.timeline-item{ padding: 12px 0 12px 12px; border-left: 2px solid var(--border); position: relative;}
+.timeline-item .dot{
+  position:absolute; left:-6px; top: 18px;
+  width:10px; height:10px; border-radius:50%;
+  background: var(--brand);
+  box-shadow: 0 0 0 2px #fff;
+}
+.timeline .sep{ color: var(--muted); }
+
+/* linea orizzontale di separazione fra gli item */
+.timeline-item:not(:last-child){
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 14px;   /* spazio prima del divisore */
+  margin-bottom: 10px;    /* spazio dopo il divisore */
+}
+
+
+/* Contenuto riga */
+.timeline .content{ position:relative; padding-right: 0.5rem; }
+.area-badge{
+  background: #eaf7ff;               /* azzurro soft */
+  color: var(--brand-ink);
+  border: 1px solid #d7efff;
+  font-weight: 700;
+}
+
+/* — Bottoni “Apri” con lo stesso stile blu dei CTA — */
+.btn-open{
+  /* eredita il gradient da .btn-primary del tuo tema */
+  padding-left: 1.1rem;
+  padding-right: 1.1rem;
+  font-weight: 700;
+  border-radius: 12px;
+  box-shadow: 0 6px 16px rgba(0,0,0,.08);
+  transition: transform .08s ease, filter .12s ease;
+}
+.btn-open:hover{ transform: translateY(-1px); filter: brightness(1.03); }
+@media (min-width: 576px){
+  .btn-open{
+    display: inline-flex;           /* abilita centering flex */
+    align-items: center;            /* centro verticale */
+    justify-content: center;        /* centro orizzontale */
+    min-height: 44px;               /* altezza costante */
+    min-width: 180px;               /* più largo */
+    text-align: center;             /* fallback */
+  }
+}
+
+/* — Mobile: bottone più piccolo in basso a destra — */
+.btn-open-mobile{
+  position:absolute;
+  right: 6px;
+  bottom: 8px;
+  padding: .45rem .7rem;
+  font-size: .9rem;
+  font-weight: 700;
+  border-radius: 12px;
+  line-height: 1.1;
+  box-shadow: 0 6px 16px rgba(0,0,0,.08);
+}
+@media (max-width: 575.98px){
+  /* spazio sotto il testo per non sovrapporsi al bottone mobile */
+  .timeline .content{ padding-bottom: 44px; }
+}
+
+/* Allineamenti e spaziature coerenti col tema */
+.section-title{ font-weight: 700; letter-spacing: .2px; }
+.subtle{ color: var(--muted); }
+
+/* opzionale: rendi la linea un filo più visibile */
+@media (prefers-color-scheme: light){
+  .timeline-item:not(:last-child){
+    border-bottom-color: #dfe5ef;   /* leggermente più marcata ma in palette */
+  }
 }
 </style>
 

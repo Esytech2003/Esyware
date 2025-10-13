@@ -1231,10 +1231,17 @@ def client_departments():
         if it.product and it.product.department_id and (it.qty_requested or 0) > 0:
             counts[it.product.department_id] = counts.get(it.product.department_id, 0) + 1
 
-    # Aree note e aree permesse all'utente
-    all_areas = list_macro_areas()  # es. ["sala","cucina","prova", ...]
+        # Aree note e aree permesse all'utente
+    all_areas = list_macro_areas()  # es. ["sala","cucina",...]
+    # Fallback robusto: se non configurate, ricava dalle macro_area dei reparti
+    if not all_areas:
+        all_areas = sorted({(d.macro_area or "sala").lower() for d in departments})
+
     if current_user.role == "employee":
         allowed = set(allowed_macro_areas_for(current_user))
+        # ulteriore fallback: se non ci sono regole salvate, permetti tutte le aree note
+        if not allowed:
+            allowed = set(all_areas)
     else:
         allowed = set(all_areas)
 
@@ -1245,7 +1252,7 @@ def client_departments():
         if area in allowed:
             deps_by_area.setdefault(area, []).append(d)
 
-    # Info sblocco per ogni area (mostrale SEMPRE se permesse)
+    # Info sblocco + reparti (ordinati) per la UI
     unlocked = session.get("macro_unlock", {})  # {"sala": True, ...}
     areas = []
     for area in all_areas:
@@ -1255,7 +1262,7 @@ def client_departments():
         deps = sorted(deps_by_area.get(area, []), key=lambda x: (x.name or "").lower())
         areas.append({
             "area": area,
-            "deps": deps,                          # può essere lista vuota
+            "deps": deps,                          # ora non risulterà vuoto se esistono reparti
             "code_required": (code != ""),
             "unlocked": unlocked.get(area, False) or (code == ""),
         })
@@ -1263,13 +1270,106 @@ def client_departments():
     # Totale righe >0 per abilitare invio
     total_selected = sum(1 for it in draft.items if (it.qty_requested or 0) > 0)
 
+    # --- Ultimi 2 riepiloghi inviati (per il negozio effettivo) ---
+    shop_id = current_shop_id()
+    last_two_reqs = (
+        RequestHeader.query
+        .filter_by(client_id=shop_id, status="inviata")
+        .order_by(RequestHeader.created_at.desc())
+        .limit(2)
+        .options(
+            joinedload(RequestHeader.items)
+              .joinedload(RequestItem.product)
+              .joinedload(Product.department)
+        )
+        .all()
+    )
+
+    def _areas_for_req(rh: RequestHeader):
+        areas_set = set()
+        for it in rh.items:
+            if (it.qty_requested or 0) <= 0:
+                continue
+            dep = getattr(it.product, "department", None)
+            area = (getattr(dep, "macro_area", None) or "sala").lower()
+            areas_set.add(area)
+        return sorted(areas_set)
+
+    history = []
+    for rh in last_two_reqs:
+        rows_count = sum(1 for it in rh.items if (it.qty_requested or 0) > 0)
+        history.append({
+            "id": rh.id,           # <— serve per link al dettaglio
+            "dt": rh.created_at,   # UTC; usa |local_dt nel template
+            "rows": rows_count,
+            "areas": _areas_for_req(rh),
+        })
+
     return render_template(
         "client/departments.html",
         areas=areas,
         counts=counts,
         total_selected=total_selected,
+        history=history,   # <— passato al template
     )
 
+
+@app.get("/client/riepilogo/inviato/<int:req_id>")
+@login_required
+@require_roles("employee")
+def client_sent_request_view(req_id):
+    """
+    Mostra in sola lettura un riepilogo inviato (qty_requested > 0),
+    raggruppato per macro-area e reparto. Accesso consentito solo
+    se appartiene al negozio dell'employee corrente.
+    """
+    rh = RequestHeader.query.get_or_404(req_id)
+
+    # sicurezza: l'employee può vedere solo il suo negozio
+    shop_id = current_shop_id()
+    if rh.client_id != shop_id or rh.status != "inviata":
+        flash("Riepilogo non accessibile.", "danger")
+        return redirect(url_for("client_departments"))
+
+    # prendo solo righe > 0
+    items = [it for it in rh.items if (it.qty_requested or 0) > 0]
+
+    from collections import defaultdict
+    grouped = defaultdict(lambda: defaultdict(list))  # area -> dep -> [items]
+
+    for it in items:
+        if not it.product or not it.product.department:
+            continue
+        area = (it.product.department.macro_area or "sala").lower()
+        dep_name = it.product.department.name or "Senza reparto"
+        grouped[area][dep_name].append(it)
+
+    # ordino reparti e prodotti
+    def sort_blocks(area_map: dict):
+        blocks = []
+        for dep, rows in area_map.items():
+            rows_sorted = sorted(
+                rows, key=lambda x: (x.product.name or "").lower() if x.product else ""
+            )
+            blocks.append({"department": dep, "rows": rows_sorted})
+        blocks.sort(key=lambda b: (b["department"] or "").lower())
+        return blocks
+
+    # Ordine aree = configurazione attuale + eventuali aree non in elenco
+    all_areas = list_macro_areas() or ["sala", "cucina"]
+    ordered = {}
+    for a in all_areas:
+        if a in grouped:
+            ordered[a] = sort_blocks(grouped[a])
+    for a in grouped.keys():
+        if a not in ordered:
+            ordered[a] = sort_blocks(grouped[a])
+
+    return render_template(
+        "client/sent_request_view.html",
+        rh=rh,
+        areas_blocks=ordered,
+    )
 
 @app.route("/client/reparti/<int:dep_id>", methods=["GET", "POST"])
 @login_required

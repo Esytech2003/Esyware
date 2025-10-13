@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h1 class="h5 m-0">
+    Riepilogo inviato — {{ rh.created_at | local_dt('%d/%m/%Y %H:%M') }}
+  </h1>
+  <a href="{{ url_for('client_departments') }}" class="btn btn-outline-secondary">
+    ← Torna ai reparti
+  </a>
+</div>
+
+{% if areas_blocks %}
+  {% for area, blocks in areas_blocks.items() %}
+    <div class="card shadow-sm mb-4">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <h2 class="h6 m-0">{{ area|replace('_',' ')|title }}</h2>
+          <span class="badge area-badge">{{ area|replace('_',' ')|title }}</span>
+        </div>
+
+        {% if blocks|length == 0 %}
+          <div class="text-muted">Nessun prodotto in questa area.</div>
+        {% else %}
+          {% for blk in blocks %}
+            <div class="mb-3">
+              <div class="fw-semibold mb-1">{{ blk.department }}</div>
+              <div class="table-responsive">
+                <table class="table table-sm align-middle table-center-qty">
+                    <colgroup>
+                    <col>                    {# Prodotto (auto) #}
+                    <col class="col-qty">    {# Q.tà (fissa) #}
+                    <col>                    {# Note (auto) #}
+                    </colgroup>
+                    <thead>
+                    <tr>
+                        <th>Prodotto</th>
+                        <th class="text-end">Q.tà</th>
+                        <th class="text-muted">Note</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    {% for it in blk.rows %}
+                        <tr>
+                        <td>{{ it.product.name }}</td>
+                        <td class="text-end">
+                            <span class="qty">{{ it.qty_requested|fmt_qty }}</span>
+                        </td>
+                        <td class="text-muted">{{ it.note or '' }}</td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+                </div>
+            </div>
+          {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  {% endfor %}
+{% else %}
+  <div class="alert alert-info">Nessun dato disponibile per questo riepilogo.</div>
+{% endif %}
+
+<style>
+/* Badge area: palette del tema */
+.area-badge{
+  background: rgba(0,187,255,.10);
+  color: var(--brand-ink);
+  border: 1px solid var(--brand);
+  font-weight: 700;
+}
+
+/* Tabella con colonna quantità fissa e allineata */
+.table-center-qty{
+  table-layout: fixed;            /* rispetta le larghezze del colgroup */
+  width: 100%;
+}
+
+/* Larghezza vera imposta sul <col> del colgroup */
+.table-center-qty col.col-qty{
+  width: 120px;
+}
+
+/* Allineamento e numeri tabulari sulla cella quantità */
+.table-center-qty th.col-qty,
+.table-center-qty td.col-qty{
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+}
+
+/* su schermi piccoli: un filo più stretta */
+@media (max-width: 768px){
+  .table-center-qty col.col-qty{ width: 96px; }
+}
+
+/* rifiniture coerenti con tema */
+.table thead th{
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.card{ border: 1px solid var(--border); }
+</style>
+
+{% endblock %}
