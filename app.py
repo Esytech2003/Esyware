@@ -1332,6 +1332,8 @@ def client_products(dep_id):
 @login_required
 @require_roles("employee")
 def client_review():
+    from collections import defaultdict
+
     client_id_for_work = current_user.works_for_client_id
     draft = get_or_create_draft_request(client_id_for_work)
     draft = RequestHeader.query.get(draft.id)  # ricarica per sicurezza
@@ -1339,8 +1341,7 @@ def client_review():
     # Solo righe con quantità > 0
     items = [i for i in draft.items if (i.qty_requested or 0) > 0]
 
-    from collections import defaultdict
-
+    # ---------- RAGGRUPPAMENTO / ORDINAMENTO (serve per GET e per eventuale POST fallito) ----------
     def dep_name_of(it):
         if it.product and it.product.department and it.product.department.name:
             return it.product.department.name
@@ -1349,7 +1350,7 @@ def client_review():
     # Aree consentite per questo employee
     allowed_areas = set(allowed_macro_areas_for(current_user))
 
-    # Raggruppo DINAMICAMENTE: macro_area -> reparto -> [items]
+    # macro_area -> reparto -> [items]
     grouped = defaultdict(lambda: defaultdict(list))
     for it in items:
         area = (getattr(getattr(it.product, "department", None), "macro_area", "sala") or "sala").lower()
@@ -1366,8 +1367,8 @@ def client_review():
         blocks.sort(key=lambda b: (b["department"] or "").lower())
         return blocks
 
-    # Ordine aree: quello definito in amministrazione; poi eventuali aree “extra” incontrate
-    areas_order = list_macro_areas()  # es. ["sala","cucina","detersivi", ...]
+    # Ordine aree: quello definito in amministrazione; poi eventuali aree “extra”
+    areas_order = list_macro_areas()
     grouped_macro_sorted = {}
     for a in areas_order:
         if a in grouped:
@@ -1376,48 +1377,83 @@ def client_review():
         if a not in grouped_macro_sorted:
             grouped_macro_sorted[a] = sort_blocks(grouped[a])
 
-    
-
+    # ----------------------------------- POST: INVIO / MERGE -----------------------------------
     if request.method == "POST":
         if len(items) == 0:
             flash("Aggiungi almeno una quantità prima di inviare.", "warning")
             return redirect(url_for("client_departments"))
 
-        # --- giorno locale Europe/Rome per l'overwrite ---
+        # Giorno locale Europe/Rome per separare 23:59 e 00:10 in giorni diversi
         today_ymd = (datetime.now(TZ_ROME).date() if TZ_ROME else datetime.utcnow().date()).strftime("%Y-%m-%d")
         start_utc, end_utc = local_day_range_utc(today_ymd)
 
-        # 1) elimina TUTTE le 'inviata' di quel negozio in quel giorno
+        # Cerca se esiste già una giacenza 'inviata' oggi per questo negozio
         existing = (
             RequestHeader.query
             .filter_by(client_id=client_id_for_work, status="inviata")
             .filter(RequestHeader.created_at >= start_utc)
             .filter(RequestHeader.created_at <  end_utc)
-            .all()
+            .order_by(RequestHeader.created_at.desc())
+            .first()
         )
-        for rh in existing:
-            db.session.delete(rh)
 
-        # 2) finalizza la bozza come "inviata"
-        draft.created_at = datetime.utcnow()
-        draft.status = "inviata"
-        draft.submitted_by_user_id = current_user.id
+        if existing is None:
+            # Prima inviata del giorno → finalizza la bozza
+            draft.created_at = datetime.utcnow()
+            draft.status = "inviata"
+            draft.submitted_by_user_id = current_user.id
+            db.session.commit()
+            flash("Giacenza inviata al magazzino!", "success")
+        else:
+            # Esiste già oggi → MERGE (override per prodotti presenti nella nuova submission)
+            existing_map = {it.product_id: it for it in existing.items}
+            updated_count = 0
+            added_count = 0
 
-        db.session.commit()
+            for it in draft.items:
+                qty = it.qty_requested or 0
+                if qty <= 0:
+                    # Se adesso è 0/assente, NON tocchiamo la riga già presente in existing
+                    # (Se vuoi che 0 AZZERI la riga esistente, dimmelo: è una riga da cambiare.)
+                    continue
 
-        flash("Giacenza inviata al magazzino!", "success")
+                pid = it.product_id
+                if pid in existing_map:
+                    dest = existing_map[pid]
+                    dest.qty_requested = qty            # <-- SOSTITUZIONE, NON SOMMA
+                    dest.note = it.note
+                    updated_count += 1
+                else:
+                    db.session.add(RequestItem(
+                        request_id=existing.id,
+                        product_id=pid,
+                        qty_requested=qty,
+                        note=it.note
+                    ))
+                    added_count += 1
+
+            existing.submitted_by_user_id = current_user.id
+            db.session.commit()
+
+            # Svuota la bozza per ripartire pulito
+            RequestItem.query.filter_by(request_id=draft.id).delete(synchronize_session=False)
+            db.session.commit()
+
+            parts = []
+            if updated_count: parts.append(f"{updated_count} prodotti aggiornati")
+            if added_count:   parts.append(f"{added_count} nuovi")
+            flash("Giacenza aggiornata (" + (", ".join(parts) if parts else "nessuna modifica") + ").", "success")
+
         return redirect(url_for("client_departments"))
 
-
-
-
-    # GET → mostra pagina
+    # ----------------------------------- GET: render -----------------------------------
     return render_template(
         "client/review.html",
         draft=draft,
         items=items,
         grouped_macro=grouped_macro_sorted
     )
+
 
 
 @app.cli.command("cleanup-inviate-duplicate-days")
