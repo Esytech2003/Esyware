@@ -6,9 +6,6 @@
     Dettaglio giacenze — {{ client.display_name }}
     <small class="text-muted">({{ date_filter }}, pair #{{ rank }})</small>
   </h1>
-  <a href="{{ url_for('admin_dashboard', date=date_filter) }}" class="btn btn-outline-secondary">
-    ← Torna alla dashboard
-  </a>
 </div>
 
 {% if sala_request or cucina_request %}
