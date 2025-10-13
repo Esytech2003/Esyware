@@ -1,19 +1,24 @@
 {% extends "base.html" %}
 {% block content %}
-<h1 class="h4 mb-3">
-  Dettaglio giacenze — {{ client.display_name }}
-  <small class="text-muted">({{ date_filter }}, pair #{{ rank }})</small>
-</h1>
+
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h1 class="h5 m-0">
+    Dettaglio giacenze — {{ client.display_name }}
+    <small class="text-muted">({{ date_filter }}, pair #{{ rank }})</small>
+  </h1>
+  <a href="{{ url_for('admin_dashboard', date=date_filter) }}" class="btn btn-outline-secondary">
+    ← Torna alla dashboard
+  </a>
+</div>
 
 {% if sala_request or cucina_request %}
-  <div class="mb-3 text-muted">
+  <div class="mb-3 subtle">
     {% if sala_request %}Sala: {{ sala_request.created_at|local_time }}{% endif %}
     {% if sala_request and cucina_request %} · {% endif %}
     {% if cucina_request %}Cucina: {{ cucina_request.created_at|local_time }}{% endif %}
   </div>
 {% endif %}
 
-{# --- AREE DINAMICHE --- #}
 {% set total_areas = areas_blocks|length %}
 {% if not areas_blocks or total_areas == 0 %}
   <div class="text-muted">Nessun articolo in questa coppia.</div>
@@ -23,9 +28,25 @@
       <div class="col-12">
         <div class="card shadow-sm h-100 mb-2">
           <div class="card-body">
-            <h2 class="h6 mb-3" style="text-transform: capitalize;">{{ area }}</h2>
+            <div class="d-flex align-items-center justify-content-between mb-2">
+              <h2 class="h6 m-0" style="text-transform: capitalize;">{{ area }}</h2>
+              <span class="badge area-badge">{{ area|replace('_',' ')|title }}</span>
+            </div>
+
             <div class="table-responsive">
               <table class="table table-sm align-middle table-center-qty">
+                <colgroup>
+                  <col class="col-prod">
+                  <col class="col-qty">
+                  <col class="col-note d-none d-md-table-cell">
+                </colgroup>
+                <thead>
+                  <tr class="group-subhead">
+                    <th>Prodotto</th>
+                    <th class="text-end">Q.tà</th>
+                    <th class="d-none d-md-table-cell">Note</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {% for blk in blocks %}
                     <tr>
@@ -35,23 +56,30 @@
                         </div>
                       </td>
                     </tr>
-                    <!-- sub-header SOTTO al chip -->
-                    <tr class="group-subhead">
-                      <th>Prodotto</th>
-                      <th class="col-qty text-center">Q.tà</th>
-                      <th class="col-spacer d-none d-md-table-cell"></th>
-                    </tr>
+
                     {% for it in blk.rows %}
                       <tr>
-                        <td>{{ it.product.name }}</td>
-                        <td class="col-qty text-center">{{ it.qty_requested|fmt_qty }}</td>
-                        <td class="col-spacer d-none d-md-table-cell"></td>
+                        <td>
+                          <div class="prod-name">{{ it.product.name }}</div>
+                          {% if it.note %}
+                            <div class="note-inline d-md-none text-muted small mt-1">{{ it.note }}</div>
+                          {% endif %}
+                        </td>
+
+                        <td class="text-end qty-cell">{{ it.qty_requested|fmt_qty }}</td>
+
+                        <td class="d-none d-md-table-cell">
+                          {% if it.note %}
+                            <div class="text-muted small wrap-note">{{ it.note }}</div>
+                          {% endif %}
+                        </td>
                       </tr>
                     {% endfor %}
                   {% endfor %}
                 </tbody>
               </table>
             </div>
+
           </div>
         </div>
       </div>
@@ -77,16 +105,53 @@
 </div>
 
 <style>
-  .table-center-qty th, .table-center-qty td { vertical-align: middle; }
-  .col-qty { width:110px; }
-  .group-chip{
-    display:inline-block;
-    padding:.35rem .7rem;
-    border-radius:999px;
-    background:#f7f8fa;
-    border:1px solid var(--border);
-    box-shadow: 0 4px 14px rgba(0,0,0,.06) inset, 0 6px 16px rgba(0,0,0,.04);
-    font-weight:700;
-  }
+/* Badge area: palette del tema */
+.area-badge{
+  background: rgba(0,187,255,.10);
+  color: var(--brand-ink);
+  border: 1px solid var(--brand);
+  font-weight: 700;
+}
+
+/* Tabella: colonna quantità realmente fissa e allineata */
+.table-center-qty{ table-layout: fixed; }
+.col-prod { width: auto; }
+.col-qty  { width: 120px; }
+.col-note { width: auto; }
+
+.qty-cell{
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px){
+  .col-qty  { width: 96px; }
+}
+
+/* Intestazioni e bordi coerenti col tema */
+.table thead th{
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.card{ border: 1px solid var(--border); }
+.table th, .table td { vertical-align: middle; }
+
+/* Note: gestione testo lungo */
+.wrap-note{ white-space: normal; word-break: break-word; }
+.prod-name{ white-space: normal; word-break: break-word; }
+
+/* Chip reparto */
+.group-chip{
+  display:inline-block;
+  padding:.35rem .7rem;
+  border-radius:999px;
+  background:#f7f8fa;
+  border:1px solid var(--border);
+  box-shadow: 0 4px 14px rgba(0,0,0,.06) inset, 0 6px 16px rgba(0,0,0,.04);
+  font-weight:700;
+}
+.group-subhead th{ font-weight:600; color:var(--muted); }
 </style>
+
 {% endblock %}
