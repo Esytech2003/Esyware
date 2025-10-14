@@ -30,13 +30,12 @@
               <span class="badge area-badge">{{ area|replace('_',' ')|title }}</span>
             </div>
 
-            
             <div class="table-responsive">
               <table class="table table-sm align-middle table-center-qty w-100">
                 <colgroup>
-                  <col>                {# Prodotto #}
-                  <col style="width:120px">  {# Q.tà #}
-                  <col>                {# Spacer, resta visibile anche su mobile #}
+                  <col>                       {# Prodotto (auto) #}
+                  <col style="width:120px">    {# Q.tà (fissa) #}
+                  <col>                       {# Note (auto) #}
                 </colgroup>
                 <tbody>
                   {% for blk in blocks %}
@@ -50,27 +49,27 @@
 
                     <tr class="group-subhead">
                       <th>Prodotto</th>
-                      <th class="col-qty text-end">Q.tà</th>
-                      <th class="col-spacer"></th>
+                      <th class="text-end">Q.tà</th>
+                      <th class="text-muted">Note</th>
                     </tr>
 
                     {% for it in blk.rows %}
                       <tr>
-                        <td>{{ it.product.name }}</td>
-                        <td class="col-qty text-end">{{ it.qty_requested|fmt_qty }}</td>
-                        <td class="col-spacer"></td>
+                        <td class="prod-name">{{ it.product.name }}</td>
+                        <td class="text-end qty-cell">{{ it.qty_requested|fmt_qty }}</td>
+                        <td class="wrap-note">
+                          {{ it.note if it.note else '' }}
+                        </td>
                       </tr>
                     {% endfor %}
 
-                    {# separatore full-width tra reparti #}
                     {% if not loop.last %}
-                      <tr class="sep"><td colspan="3"></td></tr>
+                      <tr class="tr-sep"><td colspan="3"></td></tr>
                     {% endif %}
                   {% endfor %}
                 </tbody>
               </table>
             </div>
-
 
           </div>
         </div>
@@ -107,35 +106,24 @@
 
 /* ===== Tabella riepilogo ===== */
 .table-center-qty{
-  table-layout: fixed;           /* colonne stabili */
+  table-layout: fixed;         /* fissa davvero la colonna quantità */
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
 }
-
+.table-center-qty th, .table-center-qty td{ vertical-align: middle; }
 .table-center-qty thead th{
   color: var(--muted);
   border-bottom: 1px solid var(--border);
   font-weight: 600;
 }
 
-.table-center-qty th, .table-center-qty td{
-  vertical-align: middle;
-}
-
 /* Colonne */
-.col-prod { width: auto; }
-.col-qty  { width: 120px; }      /* colonna quantità davvero fissa */
-.col-note { width: auto; }
-
-/* Cella quantità */
 .qty-cell{
   white-space: nowrap;
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
-
-/* Prodotti / Note: testo lungo */
 .prod-name,
 .wrap-note{
   white-space: normal;
@@ -144,7 +132,7 @@
 
 /* Mobile: quantità un filo più stretta */
 @media (max-width: 768px){
-  .col-qty { width: 96px; }
+  .table-center-qty colgroup col:nth-child(2){ width: 96px !important; }
 }
 
 /* ===== Chip reparto + subhead ===== */
@@ -163,9 +151,9 @@
   border-bottom: 1px solid var(--border);
 }
 
-/* ===== Separatore full-width tra reparti ===== */
+/* ===== Separatore full-width tra reparti (desktop e mobile) ===== */
 .tr-sep td{
-  padding: 0;
+  padding: 0 !important;
   border: 0 !important;
 }
 .tr-sep td::after{
@@ -174,10 +162,10 @@
   height: 1px;
   width: 100%;
   background: var(--border);
-  margin: .5rem 0;
+  margin: .6rem 0;
 }
 
-/* ===== Card bordo coerente tema ===== */
+/* ===== Card bordo coerente con il tema ===== */
 .card{ border: 1px solid var(--border); }
 </style>
 

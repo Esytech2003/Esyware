@@ -568,6 +568,36 @@ def local_business_day_range_utc(ymd: str):
         end_utc   = start_utc + timedelta(days=1)
     return start_utc, end_utc
 
+
+from datetime import time as dtime  # alias per non confliggere con 'time' altrove
+
+def local_cycle_bounds_for(dt_utc):
+    """
+    Ritorna (start_local, end_local) del ciclo 'giorno' 04:00→04:00
+    che contiene dt_utc (UTC naive in DB).
+    """
+    dt_local = to_rome(dt_utc)  # -> aware Europe/Rome
+    four = dtime(4, 0)
+    if dt_local.time() >= four:
+        start_local = datetime(dt_local.year, dt_local.month, dt_local.day, 4, 0, tzinfo=TZ_ROME)
+    else:
+        prev = dt_local.date() - timedelta(days=1)
+        start_local = datetime(prev.year, prev.month, prev.day, 4, 0, tzinfo=TZ_ROME)
+    end_local = start_local + timedelta(days=1)
+    return start_local, end_local
+
+def can_edit_request_timewindow(rh: RequestHeader) -> bool:
+    """
+    True se ORA (Europe/Rome) è prima della fine del ciclo 04:00 successivo
+    alla creazione della giacenza.
+    """
+    if not rh or rh.status != "inviata":
+        return False
+    _, end_local = local_cycle_bounds_for(rh.created_at)
+    now_local = datetime.now(TZ_ROME)
+    return now_local < end_local
+
+
 def build_request_rows_for_admin(only_date: str = None):
     """
     Ritorna la lista di righe per 'Giacenze ricevute'.
@@ -661,6 +691,33 @@ def local_day_range_utc(ymd: str):
 
     return start_utc, end_utc
 
+
+from datetime import datetime, timedelta, timezone
+from dateutil import tz
+TZ_ROME = tz.gettz("Europe/Rome")
+
+def _is_editable_4to4(created_at_utc_naive: datetime):
+    """
+    Ritorna (editable_bool, deadline_utc_naive) per la finestra 04:00→04:00 Europe/Rome.
+    """
+    if created_at_utc_naive is None:
+        return (False, None)
+
+    created_local = created_at_utc_naive.replace(tzinfo=timezone.utc).astimezone(TZ_ROME)
+
+    # blocco locale della “giornata” 04:00→04:00
+    if created_local.hour < 4:
+        start_local = created_local.replace(hour=4, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    else:
+        start_local = created_local.replace(hour=4, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)  # 24h dopo
+
+    now_local = datetime.now(TZ_ROME)
+    editable = (now_local < end_local)
+
+    # deadline in UTC-naive (come salvi created_at)
+    deadline_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return (editable, deadline_utc)
 
 def parse_qty(s: str) -> Decimal:
     s = (s or "").strip().replace(",", ".")
@@ -1260,13 +1317,40 @@ def client_departments():
     # Bozza per il negozio effettivo
     draft = get_or_create_draft_request(current_shop_id())
 
-    # Conteggio righe compilate per reparto
+    # Conteggio righe compilate > 0 per reparto (per il badge verde classico)
     counts = {}
     for it in draft.items:
         if it.product and it.product.department_id and (it.qty_requested or 0) > 0:
             counts[it.product.department_id] = counts.get(it.product.department_id, 0) + 1
 
-        # Aree note e aree permesse all'utente
+    # ===== COMPLETATO A ZERO: tile verde anche se tutte le qty sono 0 =====
+    # 1) mappa dei product attivi per reparto (una sola query)
+    from collections import defaultdict
+    dep_prod_ids = defaultdict(list)   # dep_id -> [product_id...]
+    for p in Product.query.filter_by(active=True).all():
+        if p.department_id:
+            dep_prod_ids[p.department_id].append(p.id)
+
+    # 2) insieme dei product_id presenti in bozza (anche qty=0 conta come "compilato")
+    draft_pids = {it.product_id for it in draft.items if it.product_id}
+
+    # 3) per ogni reparto: tutti compilati? e nessuna riga >0? -> "all_zero" True
+    all_zero_map = {}   # dep_id -> bool
+    for d in departments:
+        if not d.active:
+            all_zero_map[d.id] = False
+            continue
+        prod_ids = dep_prod_ids.get(d.id, [])
+        total_active = len(prod_ids)
+        if total_active == 0:
+            all_zero_map[d.id] = False
+            continue
+
+        filled = sum(1 for pid in prod_ids if pid in draft_pids)  # compilati anche a 0
+        compiled_positive = int(counts.get(d.id, 0) or 0)         # già calcolato sopra
+        all_zero_map[d.id] = (filled == total_active) and (compiled_positive == 0)
+
+    # ===== Aree note e aree permesse all'utente =====
     all_areas = list_macro_areas()  # es. ["sala","cucina",...]
     # Fallback robusto: se non configurate, ricava dalle macro_area dei reparti
     if not all_areas:
@@ -1345,8 +1429,12 @@ def client_departments():
         areas=areas,
         counts=counts,
         total_selected=total_selected,
-        history=history,   # <— passato al template
+        history=history,            # <— passato al template
+        all_zero_map=all_zero_map,  # <— NUOVO: per colorare verde “tutti 0”
     )
+
+
+
 
 
 @app.get("/client/riepilogo/inviato/<int:req_id>")
@@ -1400,10 +1488,15 @@ def client_sent_request_view(req_id):
         if a not in ordered:
             ordered[a] = sort_blocks(grouped[a])
 
+    start_local, end_local = local_cycle_bounds_for(rh.created_at)
+    eta_minutes = int((end_local - datetime.now(TZ_ROME)).total_seconds() // 60)
+
     return render_template(
         "client/sent_request_view.html",
         rh=rh,
         areas_blocks=ordered,
+        can_edit=can_edit_request_timewindow(rh),
+        edit_deadline=end_local, eta_minutes=max(0, eta_minutes)
     )
 
 @app.route("/client/reparti/<int:dep_id>", methods=["GET", "POST"])
@@ -1588,6 +1681,142 @@ def client_review():
         grouped_macro=grouped_macro_sorted
     )
 
+
+
+from datetime import datetime, time, timedelta, timezone
+
+
+
+from decimal import Decimal
+from sqlalchemy.orm import joinedload
+
+from decimal import Decimal
+from sqlalchemy.orm import joinedload
+
+@app.route("/client/riepilogo/<int:req_id>/edit", methods=["GET", "POST"])
+@login_required
+@require_roles("employee")
+def client_sent_edit(req_id):
+    # Carica la richiesta del negozio dell'employee
+    rh = (RequestHeader.query
+          .options(
+              joinedload(RequestHeader.items)
+              .joinedload(RequestItem.product)
+              .joinedload(Product.department)
+          )
+          .filter_by(id=req_id, status="inviata", client_id=current_user.works_for_client_id)
+          .first_or_404())
+
+    # Finestra 04:00→04:00 Europe/Rome
+    can_edit, deadline_utc = _is_editable_4to4(rh.created_at)
+    if not can_edit:
+        flash("La finestra di modifica è scaduta (dalle 04:00 alle 04:00).", "warning")
+        return redirect(url_for("client_sent_request_view", req_id=rh.id))
+    # ---------- GET: mostra form di modifica ----------
+    if request.method == "GET":
+        # Prendi TUTTE le righe “significative”: qty>0 OPPURE nota non vuota
+        rows = [it for it in rh.items if (it.qty_requested or 0) > 0 or (it.note or "").strip()]
+
+        # Raggruppa per area/reparto (come nel riepilogo)
+        from collections import defaultdict
+        areas_map = defaultdict(lambda: defaultdict(list))
+        for it in rows:
+            if not it.product or not it.product.department:
+                continue
+            area = (it.product.department.macro_area or "sala").lower()
+            dep  = it.product.department.name or "Senza reparto"
+            areas_map[area][dep].append(it)
+
+        def sort_blocks(area_map: dict):
+            blocks = []
+            for dep, rows in area_map.items():
+                rows_sorted = sorted(rows, key=lambda x: (x.product.name or "").lower())
+                blocks.append({"department": dep, "rows": rows_sorted})
+            blocks.sort(key=lambda b: (b["department"] or "").lower())
+            return blocks
+
+        # Ordine aree = quello configurato + eventuali extra
+        ordered = {}
+        for a in list_macro_areas():
+            if a in areas_map:
+                ordered[a] = sort_blocks(areas_map[a])
+        for a in areas_map.keys():
+            if a not in ordered:
+                ordered[a] = sort_blocks(areas_map[a])
+
+        # NESSUN flash “nessun dato” qui: se fosse davvero vuota, il template mostra un messaggio pulito
+        eta_minutes = max(0, int((deadline_utc - datetime.utcnow()).total_seconds() // 60))
+
+        return render_template(
+            "client/sent_request_edit.html",
+            rh=rh,
+            areas_blocks=ordered,
+            can_edit=True,
+            edit_deadline=deadline_utc,
+            eta_minutes=eta_minutes,
+        )
+
+    # ---------- POST: applica modifiche IN PLACE ----------
+    cur = {it.product_id: (Decimal(str(it.qty_requested or 0)), (it.note or "").strip())
+           for it in rh.items}
+    changed = False
+
+    posted_pids = set()
+    for k in request.form.keys():
+        if k.startswith("qty_") or k.startswith("note_"):
+            try:
+                posted_pids.add(int(k.split("_", 1)[1]))
+            except Exception:
+                pass
+
+    pids_to_touch = set(cur.keys()) | posted_pids
+
+    def _pdec(s):
+        try:
+            return Decimal(str((s or "").strip().replace(",", ".")))
+        except Exception:
+            return Decimal("0")
+
+    for pid in pids_to_touch:
+        qty_new = _pdec(request.form.get(f"qty_{pid}", None))
+        if qty_new < 0:
+            qty_new = Decimal("0")
+        qty_new = qty_new.quantize(Decimal("0.01"))
+        note_new = (request.form.get(f"note_{pid}", "") or "").strip()
+
+        qty_old, note_old = cur.get(pid, (Decimal("0"), ""))
+
+        # se tutto 0/vuoto → rimuovi eventuale riga
+        if qty_new == 0 and note_new == "":
+            if pid in cur:
+                item = next((i for i in rh.items if i.product_id == pid), None)
+                if item:
+                    db.session.delete(item)
+                    changed = True
+            continue
+
+        item = next((i for i in rh.items if i.product_id == pid), None)
+        if item is None:
+            db.session.add(RequestItem(
+                request_id=rh.id, product_id=pid,
+                qty_requested=qty_new, note=(note_new or None)
+            ))
+            changed = True
+        else:
+            if (Decimal(str(item.qty_requested or 0)) != qty_new) or ((item.note or "").strip() != note_new):
+                item.qty_requested = qty_new
+                item.note = (note_new or None)
+                changed = True
+
+    if not changed:
+        flash("Nessuna modifica rilevata.", "info")
+        return redirect(url_for("client_sent_request_view", req_id=rh.id))
+
+    db.session.commit()
+    db.session.expire_all()
+
+    flash("Giacenza aggiornata.", "success")
+    return redirect(url_for("client_sent_request_view", req_id=rh.id))
 
 
 @app.cli.command("cleanup-inviate-duplicate-days")
@@ -1832,7 +2061,8 @@ def admin_client_pair_detail(client_id, date_str, rank):
     for rh in day_requests:
         for it in rh.items:
             qty = it.qty_requested or 0
-            if qty <= 0:
+            note_txt = (it.note or "").strip()
+            if qty <= 0 and note_txt == "":
                 continue
             if not it.product or not it.product.department:
                 continue
@@ -2669,14 +2899,30 @@ def admin_delete_client(client_id):
     return redirect(url_for("admin_clients"))
 
 
+
 @app.route("/admin/giacenze")
 @login_required
 @require_role("admin")
 def admin_stock_totals():
-    # filtro testo facoltativo
-    q = (request.args.get("q") or "").strip().lower()
+    from decimal import Decimal
 
-    shops = User.query.filter_by(role="client").order_by(User.display_name).all()
+    # filtro testo facoltativo
+    q_raw = (request.args.get("q") or "").strip()
+    q = q_raw.lower()
+
+    # Tutti i negozi (user role=client), ordinati per nome
+    shops = (
+        User.query
+        .filter_by(role="client")
+        .order_by(User.display_name.asc())
+        .all()
+    )
+    # Nome coerente per ogni negozio (fallback sicuro)
+    def _shop_label(s: User) -> str:
+        return s.display_name or s.username or f"#{s.id}"
+
+    shop_labels = [_shop_label(s) for s in shops]
+
     areas = list_macro_areas() or ["sala", "cucina"]  # dinamico + fallback
 
     # product_id -> {"product": Product, "total": Decimal, "breakdown": {client_name: Decimal}}
@@ -2686,21 +2932,30 @@ def admin_stock_totals():
         if not rh:
             return
         for it in rh.items:
-            qty = it.qty_requested or 0
-            if qty <= 0:
-                continue
+            # prendi solo righe con product/department validi e della macro-area corrente
             if not it.product or not it.product.department:
                 continue
             if (it.product.department.macro_area or "sala").lower() != area_norm:
                 continue
-            pid = it.product_id
-            rec = totals.setdefault(pid, {"product": it.product, "total": 0, "breakdown": {}})
-            rec["total"] += qty
-            rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, 0) + qty
 
-    # per ogni negozio prendo l'ULTIMA richiesta con righe >0 per ciascuna macro-area
+            # Quantità (>=0). Se <=0, non incrementa ma il negozio verrà comunque mostrato a 0 dopo.
+            qty = Decimal(str(it.qty_requested or 0))
+
+            pid = it.product_id
+            rec = totals.setdefault(
+                pid,
+                {"product": it.product, "total": Decimal("0"), "breakdown": {}}
+            )
+            if qty > 0:
+                rec["total"] += qty
+                rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, Decimal("0")) + qty
+            else:
+                # Assicurati che il negozio compaia a 0 se il prodotto è presente con qty 0
+                rec["breakdown"].setdefault(shop_name, Decimal("0"))
+
+    # per ogni negozio, prendo l'ULTIMA richiesta per ciascuna macro-area (con almeno una riga > 0)
     for shop in shops:
-        shop_name = shop.display_name
+        shop_name = _shop_label(shop)
         for area in areas:
             area_norm = (area or "sala").lower()
             last_in_area = (
@@ -2709,27 +2964,35 @@ def admin_stock_totals():
                 .join(RequestItem, RequestItem.request_id == RequestHeader.id)
                 .join(Product, Product.id == RequestItem.product_id)
                 .join(Department, Department.id == Product.department_id)
-                .filter(func.lower(Department.macro_area) == area_norm,
-                        RequestItem.qty_requested > 0)
+                .filter(func.lower(Department.macro_area) == area_norm)
+                .filter(RequestItem.qty_requested >= 0)   # >= 0: prendo anche righe a zero
                 .order_by(RequestHeader.created_at.desc())
                 .first()
             )
             _accumulate_from(last_in_area, area_norm, shop_name)
 
-    # ordina per reparto, poi prodotto
-    rows = sorted(
-        totals.values(),
-        key=lambda r: (
-            (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
-            (r["product"].name.lower() if r["product"] and r["product"].name else "")
-        ),
-    )
+    # Costruisci lista righe e **completa** il breakdown con TUTTI i negozi a 0 se mancanti
+    rows = []
+    for rec in totals.values():
+        # completa i negozi mancanti a 0
+        for name in shop_labels:
+            rec["breakdown"].setdefault(name, Decimal("0"))
 
-    # filtro testo su nome prodotto
+        rows.append(rec)
+
+    # filtro testo su nome prodotto (dopo aver costruito rows)
     if q:
         rows = [r for r in rows if q in (r["product"].name or "").lower()]
 
-    return render_template("admin/stock_totals.html", rows=rows, q=(request.args.get("q") or ""))
+    # ordina per reparto, poi prodotto
+    rows.sort(
+        key=lambda r: (
+            (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
+            (r["product"].name.lower() if r["product"] and r["product"].name else "")
+        )
+    )
+
+    return render_template("admin/stock_totals.html", rows=rows, q=q_raw)
 
 
 @app.route("/admin/macro-codici", methods=["GET", "POST"])
