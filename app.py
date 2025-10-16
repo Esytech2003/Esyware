@@ -1455,7 +1455,7 @@ def client_sent_request_view(req_id):
         return redirect(url_for("client_departments"))
 
     # prendo solo righe > 0
-    items = [it for it in rh.items if (it.qty_requested or 0) > 0]
+    items = list(rh.items)
 
     from collections import defaultdict
     grouped = defaultdict(lambda: defaultdict(list))  # area -> dep -> [items]
@@ -1564,10 +1564,13 @@ def client_review():
     draft = get_or_create_draft_request(client_id_for_work)
     draft = RequestHeader.query.get(draft.id)  # ricarica per sicurezza
 
-    # Solo righe con quantità > 0
-    items = [i for i in draft.items if (i.qty_requested or 0) > 0]
+    # --- Dati per la vista (mostra anche qty = 0) ---
+    items_all = list(draft.items)  # tutte le righe, anche 0
 
-    # ---------- RAGGRUPPAMENTO / ORDINAMENTO (serve per GET e per eventuale POST fallito) ----------
+    # --- Dati per la validazione di invio ---
+    items_positive = [i for i in draft.items if (i.qty_requested or 0) > 0]
+
+    # ---------- RAGGRUPPAMENTO / ORDINAMENTO ----------
     def dep_name_of(it):
         if it.product and it.product.department and it.product.department.name:
             return it.product.department.name
@@ -1578,7 +1581,9 @@ def client_review():
 
     # macro_area -> reparto -> [items]
     grouped = defaultdict(lambda: defaultdict(list))
-    for it in items:
+    for it in items_all:
+        if not it.product:
+            continue
         area = (getattr(getattr(it.product, "department", None), "macro_area", "sala") or "sala").lower()
         if allowed_areas and area not in allowed_areas:
             continue
@@ -1605,7 +1610,8 @@ def client_review():
 
     # ----------------------------------- POST: INVIO / MERGE -----------------------------------
     if request.method == "POST":
-        if len(items) == 0:
+        # Consenti invio solo se c'è almeno una riga > 0
+        if len(items_positive) == 0:
             flash("Aggiungi almeno una quantità prima di inviare.", "warning")
             return redirect(url_for("client_departments"))
 
@@ -1639,15 +1645,16 @@ def client_review():
 
             for it in draft.items:
                 qty = it.qty_requested or 0
+
+                # Manteniamo la logica: se qty <= 0 non tocca l'esistente.
+                # (Se vuoi che 0 AZZERI l'eventuale riga esistente, dimmelo e lo cambio.)
                 if qty <= 0:
-                    # Se adesso è 0/assente, NON tocchiamo la riga già presente in existing
-                    # (Se vuoi che 0 AZZERI la riga esistente, dimmelo: è una riga da cambiare.)
                     continue
 
                 pid = it.product_id
                 if pid in existing_map:
                     dest = existing_map[pid]
-                    dest.qty_requested = qty            # <-- SOSTITUZIONE, NON SOMMA
+                    dest.qty_requested = qty            # Sostituzione, non somma
                     dest.note = it.note
                     updated_count += 1
                 else:
@@ -1677,10 +1684,9 @@ def client_review():
     return render_template(
         "client/review.html",
         draft=draft,
-        items=items,
+        items=items_all,                  # <— PASSA TUTTE LE RIGHE (anche 0) AL TEMPLATE
         grouped_macro=grouped_macro_sorted
     )
-
 
 
 from datetime import datetime, time, timedelta, timezone
@@ -1715,7 +1721,8 @@ def client_sent_edit(req_id):
     # ---------- GET: mostra form di modifica ----------
     if request.method == "GET":
         # Prendi TUTTE le righe “significative”: qty>0 OPPURE nota non vuota
-        rows = [it for it in rh.items if (it.qty_requested or 0) > 0 or (it.note or "").strip()]
+        # Prendi tutte le righe, anche qty=0 e senza nota
+        rows = list(rh.items)
 
         # Raggruppa per area/reparto (come nel riepilogo)
         from collections import defaultdict
@@ -2055,15 +2062,14 @@ def admin_client_pair_detail(client_id, date_str, rank):
     )
 
     # Raggruppo DINAMICAMENTE: area -> reparto -> [items]
+    # ... (day_requests calcolate come prima)
+
+    # Raggruppo DINAMICAMENTE: area -> reparto -> [items]
     from collections import defaultdict
     areas_map = defaultdict(lambda: defaultdict(list))
 
     for rh in day_requests:
         for it in rh.items:
-            qty = it.qty_requested or 0
-            note_txt = (it.note or "").strip()
-            if qty <= 0 and note_txt == "":
-                continue
             if not it.product or not it.product.department:
                 continue
             area = (it.product.department.macro_area or "sala").lower()
@@ -3140,32 +3146,35 @@ def admin_grid():
     else:
         selected_area = "sala"
 
+        from sqlalchemy.orm import contains_eager
+
     received = {c.id: {} for c in clients}
 
     for shop in clients:
-        last_req_in_area = (
-            RequestHeader.query
-            .filter_by(client_id=shop.id, status="inviata")
-            .join(RequestItem, RequestItem.request_id == RequestHeader.id)
+        # Prendo TUTTI gli item > 0 del negozio nell'area selezionata,
+        # ordinati dal più recente al meno recente
+        all_items = (
+            db.session.query(RequestItem)
+            .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
             .join(Product, Product.id == RequestItem.product_id)
             .join(Department, Department.id == Product.department_id)
-            .filter(Department.macro_area == selected_area, RequestItem.qty_requested > 0)
+            .filter(RequestHeader.client_id == shop.id)
+            .filter(RequestHeader.status == "inviata")
+            .filter(Department.macro_area == selected_area)
+            .filter(RequestItem.qty_requested > 0)
             .order_by(RequestHeader.created_at.desc())
-            .first()
+            .all()
         )
-        if not last_req_in_area:
-            continue
 
-        for it in last_req_in_area.items:
-            if (it.qty_requested or 0) <= 0:
+        # Per ogni prodotto, prendi la PRIMA occorrenza (cioè la più recente)
+        seen = set()
+        for it in all_items:
+            pid = it.product_id
+            if pid in seen:
                 continue
-            if not it.product or not it.product.department:
-                continue
-            if (it.product.department.macro_area or "sala") != selected_area:
-                continue
-            # se qty_requested è Decimal, va benissimo così; se vuoi forzare float: float(it.qty_requested)
-            received[shop.id][it.product_id] = it.qty_requested
-
+            seen.add(pid)
+            received[shop.id][pid] = it.qty_requested
+        
     # --- quantità consigliate per (client, product) ---
     _recs = ClientProductRecommendation.query.all()
     recommended = {(r.client_id, r.product_id): r.recommended_qty for r in _recs}
