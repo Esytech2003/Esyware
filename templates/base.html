@@ -139,6 +139,7 @@
     </div>
   </nav>
 
+  
   <!-- Page container -->
   <main class="container-xxl container-wide py-4">
     {# Flash messages: dismissible + auto-dismiss #}
@@ -157,6 +158,7 @@
 
     {% block content %}{% endblock %}
   </main>
+  
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
@@ -177,5 +179,48 @@
     });
   </script>
   
+
+{% if license_show_notice and not license_expired %}
+<div class="modal fade" id="licenseNoticeModal" tabindex="-1" aria-labelledby="licenseNoticeLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content" style="border-radius:14px;">
+      <div class="modal-header">
+        <h5 class="modal-title" id="licenseNoticeLabel">Licenza in scadenza</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Chiudi"></button>
+      </div>
+      <div class="modal-body">
+        {% if license_expires %}
+          La licenza scade il <strong>{{ license_expires.strftime('%d/%m/%Y') }}</strong>.
+        {% else %}
+          La licenza è in scadenza a breve.
+        {% endif %}
+        Contatta l’amministratore per il rinnovo.
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">OK</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Mostra il modal una sola volta per sessione
+  (function(){
+    try{
+      const key = "license_notice_shown";
+      if (!sessionStorage.getItem(key)) {
+        const el = document.getElementById('licenseNoticeModal');
+        if (el && typeof bootstrap !== "undefined") {
+          const modal = new bootstrap.Modal(el);
+          modal.show();
+          sessionStorage.setItem(key, "1");
+        }
+      }
+    }catch(e){}
+  })();
+</script>
+{% endif %}
+
+
   </body>
 </html>

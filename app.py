@@ -5,7 +5,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import func
 from sqlalchemy.orm import joinedload
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session, send_file
+from flask import abort, Flask, render_template, request, redirect, url_for, flash, jsonify, session, send_file
 from collections import defaultdict
 import io
 from decimal import Decimal, InvalidOperation
@@ -45,6 +45,75 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
+
+
+# ---- LICENZA: config da env ----
+def _read_date_env(name, default_str=None):
+    val = os.environ.get(name, default_str)
+    if not val:
+        return None
+    try:
+        return datetime.strptime(val, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+LICENSE_EXPIRES = _read_date_env("LICENSE_EXPIRES")              # es: 2025-10-31
+LICENSE_NOTICE_FROM = _read_date_env("LICENSE_NOTICE_FROM")      # es: 2025-10-26
+LICENSE_GRACE_DAYS = int(os.environ.get("LICENSE_GRACE_DAYS", "0") or "0")
+
+def today_rome():
+    # Se hai già TZ_ROME usa quello; altrimenti UTC->date()
+    try:
+        return datetime.now(TZ_ROME).date()
+    except Exception:
+        return datetime.utcnow().date()
+
+def license_status():
+    """Ritorna dict con stato licenza per la UI e i blocchi."""
+    t = today_rome()
+    expires = LICENSE_EXPIRES
+    notice_from = LICENSE_NOTICE_FROM
+    grace = LICENSE_GRACE_DAYS
+
+    show_notice = False
+    expired = False
+
+    if expires:
+        expired = (t > (expires + timedelta(days=grace)))
+        if notice_from and (t >= notice_from) and not expired:
+            show_notice = True
+
+    return {
+        "expires": expires,
+        "notice_from": notice_from,
+        "grace_days": grace,
+        "show_notice": bool(show_notice),
+        "expired": bool(expired),
+        "today": t,
+    }
+
+
+@app.before_request
+def _license_gate():
+    ls = license_status()
+
+    # Endpoints SEMPRE ammessi (anche se scaduto):
+    allow_when_expired = {
+        "static",
+        "login",
+        "logout",
+        "license_info",       # pagina informativa
+        # aggiungi qui eventuali webhook o healthcheck
+    }
+
+    endpoint = request.endpoint or ""
+    # Attenzione ai blueprint: l'endpoint potrebbe essere "admin.static" ecc.
+    endpoint_base = endpoint.split(".")[0] if "." in endpoint else endpoint
+
+    if ls["expired"] and endpoint_base not in allow_when_expired:
+        # Se vuoi bloccare anche le API/POST, reindirizza a pagina di licenza
+        return redirect(url_for("license_info"))
+    
 
 # ---------- MODELS ----------
 class User(UserMixin, db.Model):
@@ -1231,6 +1300,13 @@ def admin_grid_plan_download(plan_id):
 # ---------- ROUTES COMUNI ----------
 
 from flask import Response
+
+@app.route("/license")
+def license_info():
+    ls = license_status()
+    return render_template("license_info.html", ls=ls)
+
+
 
 @app.get("/_pdf_test")
 def _pdf_test():
@@ -3563,6 +3639,19 @@ def reset_db_command():
     print("DB resettato e ripopolato.")
 
     
+
+# --- dopo app = Flask(__name__) e dopo license_status(), prima delle route ---
+
+@app.context_processor
+def inject_license_flags():
+    ls = license_status()
+    return {
+        "license_expires": ls["expires"],
+        "license_show_notice": ls["show_notice"],
+        "license_expired": ls["expired"],
+        "license_today": ls["today"],
+    }
+
 @app.context_processor
 def inject_pending_draft_info():
     is_emp = current_user.is_authenticated and getattr(current_user, "role", None) == "employee"
@@ -3575,7 +3664,6 @@ def inject_pending_draft_info():
         "is_employee": is_emp,
         "has_pending_draft_qty": is_emp and count > 0,
         "pending_draft_qty_count": count,
-        # --- NUOVI FLAG ---
         "is_admin_full":    bool(is_admin and level == "full"),
         "is_admin_partial": bool(is_admin and level == "partial"),
     }
