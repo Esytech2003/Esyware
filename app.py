@@ -2905,7 +2905,6 @@ def admin_delete_client(client_id):
     return redirect(url_for("admin_clients"))
 
 
-
 @app.route("/admin/giacenze")
 @login_required
 @require_role("admin")
@@ -2923,7 +2922,7 @@ def admin_stock_totals():
         .order_by(User.display_name.asc())
         .all()
     )
-    # Nome coerente per ogni negozio (fallback sicuro)
+
     def _shop_label(s: User) -> str:
         return s.display_name or s.username or f"#{s.id}"
 
@@ -2934,63 +2933,72 @@ def admin_stock_totals():
     # product_id -> {"product": Product, "total": Decimal, "breakdown": {client_name: Decimal}}
     totals = {}
 
-    def _accumulate_from(rh: RequestHeader, area_norm: str, shop_name: str):
-        if not rh:
-            return
-        for it in rh.items:
-            # prendi solo righe con product/department validi e della macro-area corrente
-            if not it.product or not it.product.department:
-                continue
-            if (it.product.department.macro_area or "sala").lower() != area_norm:
-                continue
-
-            # Quantità (>=0). Se <=0, non incrementa ma il negozio verrà comunque mostrato a 0 dopo.
-            qty = Decimal(str(it.qty_requested or 0))
-
-            pid = it.product_id
-            rec = totals.setdefault(
-                pid,
-                {"product": it.product, "total": Decimal("0"), "breakdown": {}}
-            )
-            if qty > 0:
-                rec["total"] += qty
-                rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, Decimal("0")) + qty
-            else:
-                # Assicurati che il negozio compaia a 0 se il prodotto è presente con qty 0
-                rec["breakdown"].setdefault(shop_name, Decimal("0"))
-
-    # per ogni negozio, prendo l'ULTIMA richiesta per ciascuna macro-area (con almeno una riga > 0)
+    # ===== Logica STICKY per ciascun negozio e macro-area =====
+    # Per ogni negozio e area, prendo per OGNI PRODOTTO la riga più recente con qty > 0
+    # (se il negozio non ha mai inviato quel prodotto >0 in quell'area, resta 0)
     for shop in shops:
         shop_name = _shop_label(shop)
+
         for area in areas:
             area_norm = (area or "sala").lower()
-            last_in_area = (
-                RequestHeader.query
-                .filter_by(client_id=shop.id, status="inviata")
-                .join(RequestItem, RequestItem.request_id == RequestHeader.id)
+
+            # 1) Subquery: per ogni product_id dell'area, timestamp più recente con qty > 0
+            subq = (
+                db.session.query(
+                    RequestItem.product_id.label("pid"),
+                    func.max(RequestHeader.created_at).label("ts")
+                )
+                .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
                 .join(Product, Product.id == RequestItem.product_id)
                 .join(Department, Department.id == Product.department_id)
+                .filter(RequestHeader.client_id == shop.id)
+                .filter(RequestHeader.status == "inviata")
                 .filter(func.lower(Department.macro_area) == area_norm)
-                .filter(RequestItem.qty_requested >= 0)   # >= 0: prendo anche righe a zero
-                .order_by(RequestHeader.created_at.desc())
-                .first()
+                .filter(RequestItem.qty_requested > 0)
+                .group_by(RequestItem.product_id)
+                .subquery()
             )
-            _accumulate_from(last_in_area, area_norm, shop_name)
 
-    # Costruisci lista righe e **completa** il breakdown con TUTTI i negozi a 0 se mancanti
+            # 2) Join con le tabelle per recuperare la riga corrispondente a (pid, ts)
+            latest_rows = (
+                db.session.query(RequestItem, Product, Department, RequestHeader.created_at)
+                .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
+                .join(Product, Product.id == RequestItem.product_id)
+                .join(Department, Department.id == Product.department_id)
+                .join(subq, (subq.c.pid == RequestItem.product_id) & (subq.c.ts == RequestHeader.created_at))
+                .all()
+            )
+
+            for it, prod, dep, _created_at in latest_rows:
+                # sicurezza macro-area
+                if not dep or (dep.macro_area or "sala").lower() != area_norm:
+                    continue
+
+                pid = it.product_id
+                qty = Decimal(str(it.qty_requested or 0))
+                if qty <= 0:
+                    # per definizione della subquery non accade, ma teniamolo robusto
+                    continue
+
+                rec = totals.setdefault(
+                    pid,
+                    {"product": prod, "total": Decimal("0"), "breakdown": {}}
+                )
+                rec["total"] += qty
+                rec["breakdown"][shop_name] = qty
+
+    # Completa il breakdown per ogni prodotto: tutti i negozi presenti (mancanti a 0)
     rows = []
     for rec in totals.values():
-        # completa i negozi mancanti a 0
         for name in shop_labels:
             rec["breakdown"].setdefault(name, Decimal("0"))
-
         rows.append(rec)
 
-    # filtro testo su nome prodotto (dopo aver costruito rows)
+    # Filtro per nome prodotto (dopo aver costruito rows)
     if q:
         rows = [r for r in rows if q in (r["product"].name or "").lower()]
 
-    # ordina per reparto, poi prodotto
+    # Ordina per reparto, poi prodotto
     rows.sort(
         key=lambda r: (
             (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
@@ -2999,7 +3007,6 @@ def admin_stock_totals():
     )
 
     return render_template("admin/stock_totals.html", rows=rows, q=q_raw)
-
 
 @app.route("/admin/macro-codici", methods=["GET", "POST"])
 @login_required
