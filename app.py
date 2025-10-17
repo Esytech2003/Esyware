@@ -1609,18 +1609,24 @@ def client_products(dep_id):
         for p in products:
             from decimal import Decimal  # in alto se serve
 
-            qty_str = (request.form.get(f"qty_{p.id}") or "0").strip()
-            qty = parse_qty(qty_str)          # -> Decimal con 2 decimali, >= 0
+            qty_str = request.form.get(f"qty_{p.id}", None)
             note = (request.form.get(f"note_{p.id}") or "").strip() or None
 
             item = next((i for i in draft.items if i.product_id == p.id), None)
-            if item is None:
-                item = RequestItem(request_id=draft.id, product_id=p.id,
-                                qty_requested=qty, note=note)
-                db.session.add(item)
+
+            if qty_str is None or qty_str.strip() == "":
+                # NON toccare la quantità (mantieni ciò che c’è in bozza, o non creare nulla)
+                if item is not None:
+                    item.note = note  # se vuoi aggiornare solo la nota
+                # altrimenti non creare riga
             else:
-                item.qty_requested = qty
-                item.note = note
+                qty = parse_qty(qty_str)  # >= 0
+                if item is None:
+                    db.session.add(RequestItem(request_id=draft.id, product_id=p.id,
+                                            qty_requested=qty, note=note))
+                else:
+                    item.qty_requested = qty
+                    item.note = note
         db.session.commit()
         flash("Quantità salvate.", "success")
         return redirect(url_for("client_departments"))
@@ -1722,10 +1728,20 @@ def client_review():
             for it in draft.items:
                 qty = it.qty_requested or 0
 
-                # Manteniamo la logica: se qty <= 0 non tocca l'esistente.
-                # (Se vuoi che 0 AZZERI l'eventuale riga esistente, dimmelo e lo cambio.)
-                if qty <= 0:
-                    continue
+                pid = it.product_id
+                if pid in existing_map:
+                    dest = existing_map[pid]
+                    dest.qty_requested = qty      # sostituzione, anche 0
+                    dest.note = it.note
+                    updated_count += 1
+                else:
+                    db.session.add(RequestItem(
+                        request_id=existing.id,
+                        product_id=pid,
+                        qty_requested=qty,        # anche 0
+                        note=it.note
+                    ))
+                    added_count += 1
 
                 pid = it.product_id
                 if pid in existing_map:
@@ -1841,7 +1857,7 @@ def client_sent_edit(req_id):
 
     # ---------- POST: applica modifiche IN PLACE ----------
     cur = {it.product_id: (Decimal(str(it.qty_requested or 0)), (it.note or "").strip())
-           for it in rh.items}
+        for it in rh.items}
     changed = False
 
     posted_pids = set()
@@ -1854,42 +1870,47 @@ def client_sent_edit(req_id):
 
     pids_to_touch = set(cur.keys()) | posted_pids
 
-    def _pdec(s):
-        try:
-            return Decimal(str((s or "").strip().replace(",", ".")))
-        except Exception:
-            return Decimal("0")
-
     for pid in pids_to_touch:
-        qty_new = _pdec(request.form.get(f"qty_{pid}", None))
-        if qty_new < 0:
-            qty_new = Decimal("0")
-        qty_new = qty_new.quantize(Decimal("0.01"))
-        note_new = (request.form.get(f"note_{pid}", "") or "").strip()
+        raw_qty  = request.form.get(f"qty_{pid}", None)   # stringa grezza (può essere "")
+        raw_note = request.form.get(f"note_{pid}", "")
 
-        qty_old, note_old = cur.get(pid, (Decimal("0"), ""))
+        note_new = (raw_note or "").strip()
 
-        # se tutto 0/vuoto → rimuovi eventuale riga
-        if qty_new == 0 and note_new == "":
-            if pid in cur:
-                item = next((i for i in rh.items if i.product_id == pid), None)
-                if item:
-                    db.session.delete(item)
-                    changed = True
-            continue
+        # Distinguo "vuoto" da "0"/numero
+        qty_new = None
+        if raw_qty is not None:
+            if raw_qty.strip() == "":
+                qty_new = None   # NON tocco la quantità
+            else:
+                try:
+                    q = Decimal(str(raw_qty).replace(",", "."))
+                    if q < 0:
+                        q = Decimal("0")
+                    qty_new = q.quantize(Decimal("0.01"))
+                except Exception:
+                    qty_new = None  # input non valido → non tocco la qty
 
         item = next((i for i in rh.items if i.product_id == pid), None)
+
+        # Se non esiste la riga, crea solo se l'utente ha messo una qty (anche 0) o una nota
         if item is None:
-            db.session.add(RequestItem(
-                request_id=rh.id, product_id=pid,
-                qty_requested=qty_new, note=(note_new or None)
-            ))
-            changed = True
-        else:
-            if (Decimal(str(item.qty_requested or 0)) != qty_new) or ((item.note or "").strip() != note_new):
-                item.qty_requested = qty_new
-                item.note = (note_new or None)
+            if qty_new is not None or note_new != "":
+                db.session.add(RequestItem(
+                    request_id=rh.id, product_id=pid,
+                    qty_requested=(qty_new if qty_new is not None else Decimal("0")),
+                    note=(note_new or None)
+                ))
                 changed = True
+            continue
+
+        # Esiste: applica solo ciò che è stato cambiato
+        qty_old, note_old = cur.get(pid, (Decimal("0"), ""))
+
+        new_qty_to_set = (Decimal(str(item.qty_requested or 0)) if qty_new is None else qty_new)
+        if (Decimal(str(item.qty_requested or 0)) != new_qty_to_set) or ((item.note or "") != note_new):
+            item.qty_requested = new_qty_to_set
+            item.note = (note_new or None)
+            changed = True
 
     if not changed:
         flash("Nessuna modifica rilevata.", "info")
@@ -1900,7 +1921,6 @@ def client_sent_edit(req_id):
 
     flash("Giacenza aggiornata.", "success")
     return redirect(url_for("client_sent_request_view", req_id=rh.id))
-
 
 @app.cli.command("cleanup-inviate-duplicate-days")
 def cleanup_inviate_duplicate_days():
@@ -2987,100 +3007,73 @@ def admin_delete_client(client_id):
 def admin_stock_totals():
     from decimal import Decimal
 
-    # filtro testo facoltativo
     q_raw = (request.args.get("q") or "").strip()
     q = q_raw.lower()
 
-    # Tutti i negozi (user role=client), ordinati per nome
-    shops = (
-        User.query
-        .filter_by(role="client")
-        .order_by(User.display_name.asc())
+    shops = User.query.filter_by(role="client").order_by(User.display_name.asc()).all()
+    shop_labels = [s.display_name or s.username or f"#{s.id}" for s in shops]
+    shop_by_id = {s.id: (s.display_name or s.username or f"#{s.id}") for s in shops}
+
+    # Prendo TUTTI i prodotti attivi (verranno filtrati dal q sopra)
+    products = (
+        Product.query
+        .join(Department, Product.department_id == Department.id)
+        .options(joinedload(Product.department))
+        .filter(Product.active == True, Department.active == True)
+        .order_by(Department.name.asc(), Product.name.asc())
         .all()
     )
 
-    def _shop_label(s: User) -> str:
-        return s.display_name or s.username or f"#{s.id}"
-
-    shop_labels = [_shop_label(s) for s in shops]
-
-    areas = list_macro_areas() or ["sala", "cucina"]  # dinamico + fallback
-
-    # product_id -> {"product": Product, "total": Decimal, "breakdown": {client_name: Decimal}}
-    totals = {}
-
-    # ===== Logica STICKY per ciascun negozio e macro-area =====
-    # Per ogni negozio e area, prendo per OGNI PRODOTTO la riga più recente con qty > 0
-    # (se il negozio non ha mai inviato quel prodotto >0 in quell'area, resta 0)
-    for shop in shops:
-        shop_name = _shop_label(shop)
-
-        for area in areas:
-            area_norm = (area or "sala").lower()
-
-            # 1) Subquery: per ogni product_id dell'area, timestamp più recente con qty > 0
-            subq = (
-                db.session.query(
-                    RequestItem.product_id.label("pid"),
-                    func.max(RequestHeader.created_at).label("ts")
-                )
-                .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
-                .join(Product, Product.id == RequestItem.product_id)
-                .join(Department, Department.id == Product.department_id)
-                .filter(RequestHeader.client_id == shop.id)
-                .filter(RequestHeader.status == "inviata")
-                .filter(func.lower(Department.macro_area) == area_norm)
-                .filter(RequestItem.qty_requested > 0)
-                .group_by(RequestItem.product_id)
-                .subquery()
-            )
-
-            # 2) Join con le tabelle per recuperare la riga corrispondente a (pid, ts)
-            latest_rows = (
-                db.session.query(RequestItem, Product, Department, RequestHeader.created_at)
-                .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
-                .join(Product, Product.id == RequestItem.product_id)
-                .join(Department, Department.id == Product.department_id)
-                .join(subq, (subq.c.pid == RequestItem.product_id) & (subq.c.ts == RequestHeader.created_at))
-                .all()
-            )
-
-            for it, prod, dep, _created_at in latest_rows:
-                # sicurezza macro-area
-                if not dep or (dep.macro_area or "sala").lower() != area_norm:
-                    continue
-
-                pid = it.product_id
-                qty = Decimal(str(it.qty_requested or 0))
-                if qty <= 0:
-                    # per definizione della subquery non accade, ma teniamolo robusto
-                    continue
-
-                rec = totals.setdefault(
-                    pid,
-                    {"product": prod, "total": Decimal("0"), "breakdown": {}}
-                )
-                rec["total"] += qty
-                rec["breakdown"][shop_name] = qty
-
-    # Completa il breakdown per ogni prodotto: tutti i negozi presenti (mancanti a 0)
-    rows = []
-    for rec in totals.values():
-        for name in shop_labels:
-            rec["breakdown"].setdefault(name, Decimal("0"))
-        rows.append(rec)
-
-    # Filtro per nome prodotto (dopo aver costruito rows)
-    if q:
-        rows = [r for r in rows if q in (r["product"].name or "").lower()]
-
-    # Ordina per reparto, poi prodotto
-    rows.sort(
-        key=lambda r: (
-            (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
-            (r["product"].name.lower() if r["product"] and r["product"].name else "")
+    # Subquery: ultima riga (per data/ID) per (client, product)
+    # Nota: usiamo max(created_at) e come tie-breaker max(RequestHeader.id)
+    latest = (
+        db.session.query(
+            RequestHeader.client_id.label("client_id"),
+            RequestItem.product_id.label("product_id"),
+            func.max(RequestHeader.created_at).label("ts"),
+            func.max(RequestHeader.id).label("rid"),
         )
+        .join(RequestItem, RequestItem.request_id == RequestHeader.id)
+        .filter(RequestHeader.status == "inviata")
+        .group_by(RequestHeader.client_id, RequestItem.product_id)
+        .subquery()
     )
+
+    # Join alla riga vera per leggere qty
+    latest_items = (
+        db.session.query(
+            latest.c.client_id,
+            latest.c.product_id,
+            RequestItem.qty_requested
+        )
+        .join(RequestHeader, RequestHeader.id == latest.c.rid)
+        .join(RequestItem, (RequestItem.request_id == RequestHeader.id) &
+                           (RequestItem.product_id == latest.c.product_id))
+        .all()
+    )
+
+    # Mappa (client, product) -> qty (anche 0)
+    last_map = {(cid, pid): (qty or Decimal("0")) for cid, pid, qty in latest_items}
+
+    # Costruisci righe finali per tabella
+    rows = []
+    for p in products:
+        if q and q not in (p.name or "").lower():
+            continue
+
+        breakdown = {}
+        tot = Decimal("0")
+        for s in shops:
+            qty = last_map.get((s.id, p.id), Decimal("0"))
+            breakdown[shop_by_id[s.id]] = qty
+            tot += qty
+
+        # se vuoi nascondere prodotti mai inviati da nessun negozio, puoi testare "tot > 0"
+        rows.append({"product": p, "total": tot, "breakdown": breakdown})
+
+    # Ordina per reparto + prodotto
+    rows.sort(key=lambda r: ((r["product"].department.name or "").lower(),
+                             (r["product"].name or "").lower()))
 
     return render_template("admin/stock_totals.html", rows=rows, q=q_raw)
 
@@ -3244,7 +3237,7 @@ def admin_grid():
             .filter(RequestHeader.client_id == shop.id)
             .filter(RequestHeader.status == "inviata")
             .filter(Department.macro_area == selected_area)
-            .filter(RequestItem.qty_requested > 0)
+            # .filter(RequestItem.qty_requested > 0)  <-- rimosso, includiamo anche 0
             .order_by(RequestHeader.created_at.desc())
             .all()
         )
