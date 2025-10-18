@@ -2162,33 +2162,43 @@ def admin_client_pair_detail(client_id, date_str, rank):
 
     # Raggruppo DINAMICAMENTE: area -> reparto -> [items]
     from collections import defaultdict
-    areas_map = defaultdict(lambda: defaultdict(list))
+
+    # area -> dep -> { product_id : (item, ts) }  (ts = timestamp della richiesta)
+    areas_latest = defaultdict(lambda: defaultdict(dict))
 
     for rh in day_requests:
+        ts = rh.created_at
         for it in rh.items:
             if not it.product or not it.product.department:
                 continue
             area = (it.product.department.macro_area or "sala").lower()
             dep_name = it.product.department.name or "Senza reparto"
-            areas_map[area][dep_name].append(it)
+            pid = it.product_id
 
-    # Ordino reparti e prodotti
-    def sort_blocks(area_map: dict):
+            cur = areas_latest[area][dep_name].get(pid)
+            # tieni la riga con request.created_at più recente (a parità, id più alto)
+            if (cur is None) or (ts > cur[1]) or (ts == cur[1] and it.id > cur[0].id):
+                areas_latest[area][dep_name][pid] = (it, ts)
+
+    # Trasforma in struttura a blocchi come si aspetta il template
+    def sort_blocks(area_map_dict):
         blocks = []
-        for dep, rows in area_map.items():
+        for dep, pid_map in area_map_dict.items():
+            rows = [pair[0] for pair in pid_map.values()]
             rows_sorted = sorted(rows, key=lambda x: (x.product.name or "").lower())
             blocks.append({"department": dep, "rows": rows_sorted})
         blocks.sort(key=lambda b: (b["department"] or "").lower())
         return blocks
 
-    # Ordine aree = quello configurato + eventuali aree non in elenco
     ordered = {}
-    for a in list_macro_areas():            # es. ["sala","cucina","detersivi", ...]
-        if a in areas_map:
-            ordered[a] = sort_blocks(areas_map[a])
-    for a in areas_map.keys():
+    for a in list_macro_areas():
+        if a in areas_latest:
+            ordered[a] = sort_blocks(areas_latest[a])
+    for a in areas_latest.keys():
         if a not in ordered:
-            ordered[a] = sort_blocks(areas_map[a])
+            ordered[a] = sort_blocks(areas_latest[a])
+
+
 
     client = User.query.get_or_404(client_id)
 
@@ -3001,81 +3011,102 @@ def admin_delete_client(client_id):
     return redirect(url_for("admin_clients"))
 
 
+
 @app.route("/admin/giacenze")
 @login_required
 @require_role("admin")
 def admin_stock_totals():
     from decimal import Decimal
 
+    # filtro testo facoltativo
     q_raw = (request.args.get("q") or "").strip()
     q = q_raw.lower()
 
-    shops = User.query.filter_by(role="client").order_by(User.display_name.asc()).all()
-    shop_labels = [s.display_name or s.username or f"#{s.id}" for s in shops]
-    shop_by_id = {s.id: (s.display_name or s.username or f"#{s.id}") for s in shops}
-
-    # Prendo TUTTI i prodotti attivi (verranno filtrati dal q sopra)
-    products = (
-        Product.query
-        .join(Department, Product.department_id == Department.id)
-        .options(joinedload(Product.department))
-        .filter(Product.active == True, Department.active == True)
-        .order_by(Department.name.asc(), Product.name.asc())
+    # Tutti i negozi
+    shops = (
+        User.query
+        .filter_by(role="client")
+        .order_by(User.display_name.asc())
         .all()
     )
+    def _shop_label(s: User) -> str:
+        return s.display_name or s.username or f"#{s.id}"
+    shop_labels = [_shop_label(s) for s in shops]
 
-    # Subquery: ultima riga (per data/ID) per (client, product)
-    # Nota: usiamo max(created_at) e come tie-breaker max(RequestHeader.id)
-    latest = (
-        db.session.query(
-            RequestHeader.client_id.label("client_id"),
-            RequestItem.product_id.label("product_id"),
-            func.max(RequestHeader.created_at).label("ts"),
-            func.max(RequestHeader.id).label("rid"),
-        )
-        .join(RequestItem, RequestItem.request_id == RequestHeader.id)
-        .filter(RequestHeader.status == "inviata")
-        .group_by(RequestHeader.client_id, RequestItem.product_id)
-        .subquery()
-    )
+    # macro-aree dinamiche (fallback)
+    areas = list_macro_areas() or ["sala", "cucina"]
 
-    # Join alla riga vera per leggere qty
-    latest_items = (
-        db.session.query(
-            latest.c.client_id,
-            latest.c.product_id,
-            RequestItem.qty_requested
-        )
-        .join(RequestHeader, RequestHeader.id == latest.c.rid)
-        .join(RequestItem, (RequestItem.request_id == RequestHeader.id) &
-                           (RequestItem.product_id == latest.c.product_id))
-        .all()
-    )
+    # Accumulatore: product_id -> {"product": Product, "total": Decimal, "breakdown": {shop_name: Decimal}}
+    totals = {}
 
-    # Mappa (client, product) -> qty (anche 0)
-    last_map = {(cid, pid): (qty or Decimal("0")) for cid, pid, qty in latest_items}
+    for shop in shops:
+        shop_name = _shop_label(shop)
+        for area in areas:
+            area_norm = (area or "sala").lower()
 
-    # Costruisci righe finali per tabella
+            # prendi l'ULTIMA richiesta inviata di quella macro-area per il negozio
+            last_rh = (
+                RequestHeader.query
+                .filter_by(client_id=shop.id, status="inviata")
+                .join(RequestItem, RequestItem.request_id == RequestHeader.id)
+                .join(Product, Product.id == RequestItem.product_id)
+                .join(Department, Department.id == Product.department_id)
+                .filter(func.lower(Department.macro_area) == area_norm)
+                .order_by(RequestHeader.created_at.desc())
+                .first()
+            )
+            if not last_rh:
+                continue
+
+            # Dentro alla richiesta, tieni SOLO l'item più recente per ogni prodotto
+            latest_by_pid = {}
+            for it in last_rh.items:
+                if not it.product or not it.product.department:
+                    continue
+                if (it.product.department.macro_area or "sala").lower() != area_norm:
+                    continue
+                pid = it.product_id
+                # tieni l'item con id maggiore (più recente tra eventuali duplicati)
+                if (pid not in latest_by_pid) or (it.id > latest_by_pid[pid].id):
+                    latest_by_pid[pid] = it
+
+            # Accumula (mostra comunque 0 nel breakdown se qty==0)
+            for it in latest_by_pid.values():
+                qty = Decimal(str(it.qty_requested or 0))
+                pid = it.product_id
+                rec = totals.setdefault(pid, {
+                    "product": it.product,
+                    "total": Decimal("0"),
+                    "breakdown": {}
+                })
+                if qty > 0:
+                    rec["total"] += qty
+                    rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, Decimal("0")) + qty
+                else:
+                    rec["breakdown"].setdefault(shop_name, Decimal("0"))
+
+    # Completa il breakdown con tutti i negozi a 0 (per coerenza colonne)
     rows = []
-    for p in products:
-        if q and q not in (p.name or "").lower():
-            continue
+    for rec in totals.values():
+        for name in shop_labels:
+            rec["breakdown"].setdefault(name, Decimal("0"))
+        rows.append(rec)
 
-        breakdown = {}
-        tot = Decimal("0")
-        for s in shops:
-            qty = last_map.get((s.id, p.id), Decimal("0"))
-            breakdown[shop_by_id[s.id]] = qty
-            tot += qty
+    # filtro prodotto
+    if q:
+        rows = [r for r in rows if q in (r["product"].name or "").lower()]
 
-        # se vuoi nascondere prodotti mai inviati da nessun negozio, puoi testare "tot > 0"
-        rows.append({"product": p, "total": tot, "breakdown": breakdown})
-
-    # Ordina per reparto + prodotto
-    rows.sort(key=lambda r: ((r["product"].department.name or "").lower(),
-                             (r["product"].name or "").lower()))
+    # ordina per reparto poi prodotto
+    rows.sort(
+        key=lambda r: (
+            (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
+            (r["product"].name.lower() if r["product"] and r["product"].name else "")
+        )
+    )
 
     return render_template("admin/stock_totals.html", rows=rows, q=q_raw)
+
+
 
 @app.route("/admin/macro-codici", methods=["GET", "POST"])
 @login_required
