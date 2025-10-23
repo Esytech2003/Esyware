@@ -3010,19 +3010,17 @@ def admin_delete_client(client_id):
     flash("Client eliminato.", "success")
     return redirect(url_for("admin_clients"))
 
-
 @app.route("/admin/giacenze")
 @login_required
 @require_role("admin")
 def admin_stock_totals():
     from decimal import Decimal
-    from datetime import timedelta
+    from datetime import datetime, timedelta, date
 
-    # filtro testo facoltativo
     q_raw = (request.args.get("q") or "").strip()
     q = q_raw.lower()
 
-    # Tutti i negozi (client)
+    # --- anagrafiche ---
     shops = (
         User.query
         .filter_by(role="client")
@@ -3034,26 +3032,68 @@ def admin_stock_totals():
         return s.display_name or s.username or f"#{s.id}"
 
     shop_labels = [_shop_label(s) for s in shops]
-
-    # macro-aree dinamiche (fallback)
     areas = list_macro_areas() or ["sala", "cucina"]
 
+    # --- helper TZ / business-day ---
+    def _to_rome(dt_utc: datetime) -> datetime:
+        try:
+            return to_rome(dt_utc)
+        except Exception:
+            # fallback naive: considera UTC come "Roma" (ok per ordinamento relativo)
+            return dt_utc
+
+    def _business_ymd_of(dt_utc: datetime) -> str:
+        # business day = data di (Roma - 4 ore)
+        rm = _to_rome(dt_utc) - timedelta(hours=4)
+        return rm.strftime("%Y-%m-%d")
+
+    def _business_day_range_utc(ymd: str):
+        """Ritorna (start_utc, end_utc) della giornata di business (04:00→04:00 Roma)."""
+        try:
+            # se hai già local_business_day_range_utc(ymd) nel progetto usa quello:
+            return local_business_day_range_utc(ymd)
+        except Exception:
+            # fallback: costruisco 04:00 Europe/Rome e converto a UTC con offset fisso approssimato
+            # NB: per coerenza interna, se hai TZ_ROME usa quello con astimezone
+            d = datetime.strptime(ymd, "%Y-%m-%d").date()
+            # start "Roma 04:00" e end "Roma 04:00 del giorno dopo"
+            try:
+                start_rm = TZ_ROME.localize(datetime(d.year, d.month, d.day, 4, 0, 0))
+                end_rm   = TZ_ROME.localize(datetime(d.year, d.month, d.day, 4, 0, 0)) + timedelta(days=1)
+                return (start_rm.astimezone(datetime.timezone.utc).replace(tzinfo=None),
+                        end_rm.astimezone(datetime.timezone.utc).replace(tzinfo=None))
+            except Exception:
+                # ulteriore fallback grezzo: uso UTC come se fosse Roma
+                start_utc = datetime(d.year, d.month, d.day, 4, 0, 0)
+                end_utc   = start_utc + timedelta(days=1)
+                return start_utc, end_utc
+
     # ─────────────────────────────────────────────────────────────
-    # Helper: accumula i totali a partire da **una** RequestHeader
+    # Helper: accumula i totali partendo dall’ULTIMA riga utile per
+    # ogni prodotto **entro** un certo istante (<= end_utc)
     # ─────────────────────────────────────────────────────────────
-    def _accumulate_from_request(totals: dict, rh: "RequestHeader", area_norm: str, shop_name: str):
-        if not rh:
-            return
-        # Tieni l'item più recente per product_id dentro la stessa request
+    def _accumulate_asof(totals: dict, shop: User, area_norm: str, end_utc: datetime):
+        shop_name = _shop_label(shop)
+        # prendi TUTTI gli item del negozio/area con RH.created_at <= end_utc
+        # ordina dal più recente al meno recente: la prima occorrenza vista per ogni pid vince
+        items = (
+            db.session.query(RequestItem)
+            .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
+            .join(Product, Product.id == RequestItem.product_id)
+            .join(Department, Department.id == Product.department_id)
+            .filter(RequestHeader.client_id == shop.id)
+            .filter(RequestHeader.status == "inviata")
+            .filter(func.lower(Department.macro_area) == area_norm)
+            .filter(RequestHeader.created_at < end_utc)
+            .order_by(RequestHeader.created_at.desc(), RequestItem.id.desc())
+            .all()
+        )
         latest_by_pid = {}
-        for it in rh.items:
-            if not it.product or not it.product.department:
-                continue
-            if (it.product.department.macro_area or "sala").lower() != area_norm:
-                continue
+        for it in items:
             pid = it.product_id
-            if (pid not in latest_by_pid) or (it.id > latest_by_pid[pid].id):
-                latest_by_pid[pid] = it
+            if pid in latest_by_pid:
+                continue
+            latest_by_pid[pid] = it
 
         for it in latest_by_pid.values():
             qty = Decimal(str(it.qty_requested or 0))
@@ -3067,15 +3107,14 @@ def admin_stock_totals():
                 rec["total"] += qty
                 rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, Decimal("0")) + qty
             else:
+                # mostra 0 esplicito nel breakdown
                 rec["breakdown"].setdefault(shop_name, Decimal("0"))
 
     # ─────────────────────────────────────────────────────────────
-    # 1) Totali "correnti": ultima giacenza per negozio e macro-area
+    # 1) Totali "correnti" (ultima giacenza per negozio/area)
     # ─────────────────────────────────────────────────────────────
-    totals = {}
-
+    totals_now = {}
     for shop in shops:
-        shop_name = _shop_label(shop)
         for area in areas:
             area_norm = (area or "sala").lower()
             last_rh = (
@@ -3088,20 +3127,41 @@ def admin_stock_totals():
                 .order_by(RequestHeader.created_at.desc())
                 .first()
             )
-            _accumulate_from_request(totals, last_rh, area_norm, shop_name)
+            if last_rh:
+                # dentro alla richiesta, tieni l’item più recente per pid
+                latest_by_pid = {}
+                for it in last_rh.items:
+                    if not it.product or not it.product.department:
+                        continue
+                    if (it.product.department.macro_area or "sala").lower() != area_norm:
+                        continue
+                    pid = it.product_id
+                    if (pid not in latest_by_pid) or (it.id > latest_by_pid[pid].id):
+                        latest_by_pid[pid] = it
 
-    # Completa breakdown con tutti i negozi a 0 e costruisci 'rows'
+                for it in latest_by_pid.values():
+                    qty = Decimal(str(it.qty_requested or 0))
+                    pid = it.product_id
+                    rec = totals_now.setdefault(pid, {
+                        "product": it.product,
+                        "total": Decimal("0"),
+                        "breakdown": {}
+                    })
+                    if qty > 0:
+                        rec["total"] += qty
+                        rec["breakdown"][_shop_label(shop)] = rec["breakdown"].get(_shop_label(shop), Decimal("0")) + qty
+                    else:
+                        rec["breakdown"].setdefault(_shop_label(shop), Decimal("0"))
+
     rows = []
-    for rec in totals.values():
+    for rec in totals_now.values():
         for name in shop_labels:
             rec["breakdown"].setdefault(name, Decimal("0"))
         rows.append(rec)
 
-    # filtro testo su nome prodotto
     if q:
         rows = [r for r in rows if q in (r["product"].name or "").lower()]
 
-    # ordina per reparto poi prodotto
     rows.sort(
         key=lambda r: (
             (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
@@ -3110,70 +3170,22 @@ def admin_stock_totals():
     )
 
     # ─────────────────────────────────────────────────────────────
-    # 2) Trova le **ultime 2 giornate disponibili** (business day 04→04)
-    #    esclude la giornata corrente e salta giorni senza dati
+    # 2) Ultimi **7** business-day (escludo quello corrente) + carry-forward
     # ─────────────────────────────────────────────────────────────
-    def _business_ymd_of(dt_utc):
-        # helper già presente nel tuo progetto; se non c'è usa questa:
-        try:
-            return _business_ymd(dt_utc)  # se esiste già nel tuo codice
-        except NameError:
-            # fallback: 04→04 Europe/Rome
-            rome_now = to_rome(dt_utc)
-            # business day = data di (dt_utc - 4h) in Roma
-            return (rome_now - timedelta(hours=4)).strftime("%Y-%m-%d")
+    # calcolo i 7 ymd consecutivi precedenti a "oggi business"
+    today_bd = _business_ymd_of(datetime.utcnow())
+    start_date = datetime.strptime(today_bd, "%Y-%m-%d").date()
+    last7_ymd = [(start_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
 
-    # prendo un po' di richieste recenti e ricavo i business-day presenti
-    recent_headers = (
-        RequestHeader.query
-        .filter(RequestHeader.status == "inviata")
-        .order_by(RequestHeader.created_at.desc())
-        .limit(500)  # buffer sufficiente
-        .all()
-    )
-    # set ordinato dei business-day (stringhe y-m-d), escluso quello attuale
-    try:
-        today_bd = _business_ymd(datetime.utcnow())
-    except Exception:
-        # se non hai _business_ymd, calcolo con 4h come sopra
-        today_bd = _business_ymd_of(datetime.utcnow())
-
-    seen_days = []
-    hit = set()
-    for rh in recent_headers:
-        ymd = _business_ymd_of(rh.created_at)
-        if ymd == today_bd:
-            continue
-        if ymd not in hit:
-            hit.add(ymd)
-            seen_days.append(ymd)
-        if len(seen_days) >= 2:
-            break
-
-    # ─────────────────────────────────────────────────────────────
-    # 3) Costruisci i totali per ciascuno dei 2 business day trovati
-    # ─────────────────────────────────────────────────────────────
-    def _build_totals_for_business_day(ymd: str) -> list:
-        start_utc, end_utc = local_business_day_range_utc(ymd)
+    previous_days = []
+    for ymd in last7_ymd:
+        _start, end_utc = _business_day_range_utc(ymd)
         totals_day = {}
 
         for shop in shops:
-            shop_name = _shop_label(shop)
             for area in areas:
                 area_norm = (area or "sala").lower()
-                rh = (
-                    RequestHeader.query
-                    .filter_by(client_id=shop.id, status="inviata")
-                    .join(RequestItem, RequestItem.request_id == RequestHeader.id)
-                    .join(Product, Product.id == RequestItem.product_id)
-                    .join(Department, Department.id == Product.department_id)
-                    .filter(func.lower(Department.macro_area) == area_norm)
-                    .filter(RequestHeader.created_at >= start_utc,
-                            RequestHeader.created_at <  end_utc)
-                    .order_by(RequestHeader.created_at.desc())
-                    .first()
-                )
-                _accumulate_from_request(totals_day, rh, area_norm, shop_name)
+                _accumulate_asof(totals_day, shop, area_norm, end_utc)
 
         rows_day = []
         for rec in totals_day.values():
@@ -3190,18 +3202,17 @@ def admin_stock_totals():
                 (r["product"].name.lower() if r["product"] and r["product"].name else "")
             )
         )
-        return rows_day
 
-    previous_days = [
-        {"date": ymd, "rows": _build_totals_for_business_day(ymd)}
-        for ymd in seen_days
-    ]
+        previous_days.append({
+            "date": datetime.strptime(ymd, "%Y-%m-%d").strftime("%d/%m/%Y"),
+            "rows": rows_day
+        })
 
     return render_template(
         "admin/stock_totals.html",
         rows=rows,
         q=q_raw,
-        previous_days=previous_days,  # → per l’accordion in fondo
+        previous_days=previous_days,   # ora 7 giorni, ognuno con TUTTI i prodotti “as of” quel giorno
     )
 
 
