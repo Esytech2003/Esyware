@@ -15,6 +15,13 @@
     <link href="{{ url_for('static', filename='styles.css') }}" rel="stylesheet">
   </head>
 
+
+  {% if license_overlimit %}
+  <div class="alert alert-danger text-center" style="font-size:1.1rem;">
+    {{ license_message }}
+  </div>
+  {% endif %}
+
   <script>
     // Converte tutti gli elementi con data-utc="ISO8601" in ora Europe/Rome
     document.addEventListener('DOMContentLoaded', () => {

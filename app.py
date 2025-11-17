@@ -12,7 +12,8 @@ from decimal import Decimal, InvalidOperation
 
 
 
-
+from dotenv import load_dotenv
+load_dotenv()
 
 
 
@@ -46,6 +47,97 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 
+def get_plan_limits():
+    """
+    Limiti del piano, con livelli + estensioni:
+      - PLAN_LEVEL = BASE / INTERMEDIATE / CUSTOM
+      - BASE:         shops=3,  users=10
+      - INTERMEDIATE: shops=5,  users=15
+      - CUSTOM:       shops=∞,  users=∞ (999999)
+    Extra:
+      - ADD_SHOP, ADD_USER nel .env aggiungono capacità al piano scelto
+      - MAX_SHOPS, MAX_USERS se presenti sovrascrivono il totale calcolato
+    """
+    plan = (os.getenv("PLAN_LEVEL", "BASE") or "BASE").upper()
+
+    # 1) default base per piano
+    if plan == "BASE":
+        base_shops = 3
+        base_users = 10
+        locked = False
+    elif plan == "INTERMEDIATE":
+        base_shops = 5
+        base_users = 15
+        locked = False
+    else:
+        # CUSTOM (o altro): niente limiti "reali"
+        base_shops = 999_999
+        base_users = 999_999
+        locked = False
+
+    # helper per leggere interi dall'env
+    def _int_env(name, default, min_value=0):
+        val = (os.getenv(name) or "").strip()
+        if not val:
+            return default
+        try:
+            n = int(val)
+            if n < min_value:
+                return default
+            return n
+        except ValueError:
+            return default
+
+    # 2) extra dal piano: ADD_SHOP / ADD_USER
+    extra_shops = _int_env("ADD_SHOP", 0, min_value=0)
+    extra_users = _int_env("ADD_USER", 0, min_value=0)
+
+    calc_shops = base_shops + extra_shops
+    calc_users = base_users + extra_users
+
+    # 3) override totale se usi MAX_SHOPS / MAX_USERS
+    max_shops = _int_env("MAX_SHOPS", calc_shops, min_value=1)
+    max_users = _int_env("MAX_USERS", calc_users, min_value=1)
+
+    return {
+        "name": plan,
+        "max_shops": max_shops,
+        "max_users": max_users,
+        "locked": locked,
+    }
+def plan_usage():
+    """
+    Conta quanti negozi (client) e quanti utenti (admin + employee) esistono.
+    Serve sia per i blocchi lato server sia per mostrare i contatori nella UI.
+    """
+    shops = User.query.filter_by(role="client").count()
+    users = (
+        User.query
+        .filter(User.role.in_(["admin", "employee"]))
+        .count()
+    )
+    return {
+        "shops": shops,
+        "users": users,
+    }
+
+
+def check_client_limit_reached() -> bool:
+    """
+    True se il numero di negozi (client) ha raggiunto il massimo del piano.
+    """
+    limits = get_plan_limits()
+    usage = plan_usage()
+    return usage["shops"] >= limits["max_shops"]
+
+
+def check_user_limit_reached() -> bool:
+    """
+    True se il numero di utenti (admin + employee) ha raggiunto il massimo del piano.
+    """
+    limits = get_plan_limits()
+    usage = plan_usage()
+    return usage["users"] >= limits["max_users"]
 
 # ---- LICENZA: config da env ----
 def _read_date_env(name, default_str=None):
@@ -696,7 +788,7 @@ def build_request_rows_for_admin(only_date: str = None):
         # raggruppa per giorno locale
         by_day = {}  # ymd -> {"sala":[{id,created_at}], "cucina":[...]}
         for rh in reqs:
-            _business_ymd(rh.created_at)
+            ymd = _business_ymd(rh.created_at)
             if only_date and ymd != only_date:
                 continue
 
@@ -2221,6 +2313,18 @@ def admin_clients():
             flash("Permessi insufficienti: non puoi creare/modificare i negozi.", "danger")
             return redirect(url_for("admin_clients"))
 
+
+          # 🔒 BLOCCO LIMITE NEGOZI
+        if check_client_limit_reached():
+            limits = get_plan_limits()
+            flash(
+                f"Hai raggiunto il numero massimo di negozi ({limits['max_shops']}) "
+                f"previsto dal piano {limits['name']}. Contatta l’assistenza per un upgrade.",
+                "warning"
+            )
+            return redirect(url_for("admin_clients"))
+
+
         # Arriva solo il nome punto vendita dal form
         display_name = (request.form.get("display_name") or "").strip()
         if not display_name:
@@ -2380,6 +2484,17 @@ def admin_users():
 
         if User.query.filter_by(username=username).first():
             flash("Username già esistente.", "danger")
+            return redirect(url_for("admin_users"))
+
+
+        # 🔒 BLOCCO LIMITE UTENTI
+        if role in ("admin", "employee") and check_user_limit_reached():
+            limits = get_plan_limits()
+            flash(
+                f"Hai raggiunto il numero massimo di utenti ({limits['max_users']}) "
+                f"previsto dal piano {limits['name']}. Contatta l’assistenza per un upgrade.",
+                "warning"
+            )
             return redirect(url_for("admin_users"))
 
         # --- CREA ADMIN ---
@@ -2694,6 +2809,17 @@ def admin_departments():
             username    = (request.form.get("username") or "").strip()
             password    = (request.form.get("password") or "").strip()
             admin_level = (request.form.get("admin_level") or "full").strip().lower()
+
+            # 🔒 BLOCCO LIMITE UTENTI
+            if role in ("admin", "employee") and check_user_limit_reached():
+                limits = get_plan_limits()
+                flash(
+                    f"Hai raggiunto il numero massimo di utenti ({limits['max_users']}) "
+                    f"previsto dal piano {limits['name']}. Contatta l’assistenza per un upgrade.",
+                    "warning"
+                )
+                return redirect(url_for("admin_departments"))
+                        
 
             # campi employee
             shop_id       = request.form.get("shop_id", type=int)
@@ -3762,4 +3888,27 @@ def inject_pending_draft_info():
         "pending_draft_qty_count": count,
         "is_admin_full":    bool(is_admin and level == "full"),
         "is_admin_partial": bool(is_admin and level == "partial"),
+    }
+
+@app.context_processor
+def inject_plan_limits():
+    """
+    Rende disponibili in tutti i template:
+      - plan_name, plan_max_shops, plan_max_users
+      - plan_shops_used, plan_users_used
+    In modo da poter mostrare banner / messaggi di upgrade.
+    """
+    limits = get_plan_limits()
+    usage = {}
+    try:
+        usage = plan_usage()
+    except Exception:
+        usage = {"shops": 0, "users": 0}
+
+    return {
+        "plan_name": limits["name"],
+        "plan_max_shops": limits["max_shops"],
+        "plan_max_users": limits["max_users"],
+        "plan_shops_used": usage.get("shops", 0),
+        "plan_users_used": usage.get("users", 0),
     }
