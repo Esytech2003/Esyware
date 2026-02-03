@@ -2702,24 +2702,29 @@ def admin_client_detail(client_id):
     return render_template("admin/client_detail.html", client=client, requests=requests)
 
 
+
 @app.route("/admin/richieste")
 @login_required
 @require_role("admin")
 def admin_requests():
+    from datetime import datetime
+    from collections import defaultdict
+
     # Filtri: giorno singolo (date) oppure range (from/to)
     date_str = (request.args.get("date") or "").strip()
-    from_str = (request.args.get("from")  or "").strip()
-    to_str   = (request.args.get("to")    or "").strip()
+    from_str = (request.args.get("from") or "").strip()
+    to_str   = (request.args.get("to")   or "").strip()
 
-    # Prendo tutte le richieste (solo per ricavare i giorni locali per client)
+    # Query "leggera": mi servono solo created_at + client_id + nome cliente
     base_q = (
-        RequestHeader.query
-        .filter(RequestHeader.status == "inviata")
-        .options(
-            joinedload(RequestHeader.client),
-            joinedload(RequestHeader.items).joinedload(RequestItem.product).joinedload(Product.department),
-            joinedload(RequestHeader.submitted_by)
+        db.session.query(
+            RequestHeader.client_id.label("client_id"),
+            RequestHeader.created_at.label("created_at"),
+            User.display_name.label("display_name"),
+            User.username.label("username"),
         )
+        .join(User, User.id == RequestHeader.client_id)
+        .filter(RequestHeader.status == "inviata")
     )
 
     if date_str:
@@ -2736,24 +2741,30 @@ def admin_requests():
             _, e = local_day_range_utc(to_str)
             base_q = base_q.filter(RequestHeader.created_at < e)
 
+    # IMPORTANTISSIMO: niente joinedload di items qui
     all_reqs = base_q.order_by(RequestHeader.created_at.desc()).all()
 
     # Giorni locali presenti per ogni client
-    from collections import defaultdict
     ymd_by_client = defaultdict(set)
-    for rh in all_reqs:
-        ymd = _business_ymd(rh.created_at)
-        ymd_by_client[rh.client_id].add(ymd)
+    client_name_by_id = {}
 
-    # Costruisco le "righe" (card) come la dashboard: una per (client, giorno, rank)
+    for client_id, created_at, display_name, username in all_reqs:
+        if not client_id or not created_at:
+            continue
+        ymd = _business_ymd(created_at)
+        ymd_by_client[client_id].add(ymd)
+        # label client stabile
+        client_name_by_id[client_id] = display_name or username or f"#{client_id}"
+
+    # Costruisco le "righe" (card): una per (client, giorno, rank)
     rows = []  # {"client_id","client_name","rank","created_at","is_complete","date_str"}
 
-    # ordino i client per nome per stabilità, ma le card verranno poi ordinate per created_at
-    clients = {rh.client_id: rh.client for rh in all_reqs if rh.client_id}
     for client_id, ymd_set in ymd_by_client.items():
-        client = clients.get(client_id)
-        client_name = (client.display_name if client else f"#{client_id}")
-        for ymd in sorted(ymd_set):  # puoi invertire se vuoi
+        client_name = client_name_by_id.get(client_id, f"#{client_id}")
+
+        # puoi mettere reverse=True se vuoi prima i giorni più recenti
+        for ymd in sorted(ymd_set, reverse=True):
+            # Manteniamo la tua logica esistente per rank/is_complete
             pairs = combined_pairs_for_client_date_any_areas(client_id, ymd)
             for p in pairs:
                 rows.append({
@@ -2765,7 +2776,7 @@ def admin_requests():
                     "date_str": ymd,
                 })
 
-    # Ordina le card per tempo (discendente) così vedi le più recenti in alto
+    # Ordina le card per tempo (discendente)
     rows.sort(key=lambda r: (r["created_at"] or datetime.min), reverse=True)
 
     return render_template(
@@ -2775,6 +2786,9 @@ def admin_requests():
         from_filter=from_filter,
         to_filter=to_filter,
     )
+
+
+
 
 @app.route("/admin/reparti", methods=["GET", "POST"])
 @login_required
