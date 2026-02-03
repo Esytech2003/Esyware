@@ -3328,7 +3328,7 @@ def admin_stock_totals():
     # 2) Storico: nel template dici "ultimi 2 disponibili".
     #    Prima calcolavi 7 giorni (molto lento). Qui default=2, configurabile.
     # ─────────────────────────────────────────────────────────────
-    HISTORY_DAYS = int(os.environ.get("STOCK_TOTALS_HISTORY_DAYS", "2"))
+    HISTORY_DAYS = int(os.environ.get("STOCK_TOTALS_HISTORY_DAYS", "5"))
 
     today_bd = _business_ymd_of(datetime.utcnow())
     start_date = datetime.strptime(today_bd, "%Y-%m-%d").date()
