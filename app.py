@@ -3156,27 +3156,163 @@ def admin_delete_client(client_id):
     return redirect(url_for("admin_clients"))
 
 
-@app.route("/admin/giacenze")
+
+from flask import jsonify
+
+@app.route("/admin/giacenze/history")
 @login_required
 @require_role("admin")
-def admin_stock_totals():
-    """
-    Versione ottimizzata: evita N+1 e soprattutto evita (shops × areas × giorni) query.
-    Calcola "ultime giacenze per negozio" con una window function (row_number)
-    e poi somma per prodotto.
-
-    Mantiene l'output compatibile col template:
-      rows = [{"product": Product, "total": Decimal, "breakdown": {shop_name: Decimal}}]
-      previous_days = [{"date": "dd/mm/YYYY", "rows": rows_day}, ...]
-    """
+def admin_stock_totals_history():
     from decimal import Decimal
     from datetime import datetime, timedelta
     import os
 
-    # NB: richiede che tu abbia già "func" importato globalmente (sqlalchemy.func)
-    # e i modelli User, RequestHeader, RequestItem, Product, Department disponibili.
-    # Consigliato avere anche joinedload importato globalmente:
-    # from sqlalchemy.orm import joinedload
+    q_raw = (request.args.get("q") or "").strip()
+    q = q_raw.lower()
+
+    # giorni richiesti (default = env var o 5)
+    days = int(request.args.get("days") or os.environ.get("STOCK_TOTALS_HISTORY_DAYS", "5"))
+
+    # --- anagrafiche ---
+    shops = (
+        User.query
+        .filter_by(role="client")
+        .order_by(User.display_name.asc())
+        .all()
+    )
+
+    def _shop_label(s: User) -> str:
+        return s.display_name or s.username or f"#{s.id}"
+
+    shop_label_by_id = {s.id: _shop_label(s) for s in shops}
+    shop_labels = [shop_label_by_id[s.id] for s in shops]
+
+    areas = list_macro_areas() or ["sala", "cucina"]
+    areas_norm = {(a or "sala").lower() for a in areas}
+
+    # --- helper business-day ---
+    def _to_rome(dt_utc: datetime) -> datetime:
+        try:
+            return to_rome(dt_utc)
+        except Exception:
+            return dt_utc
+
+    def _business_ymd_of(dt_utc: datetime) -> str:
+        rm = _to_rome(dt_utc) - timedelta(hours=4)
+        return rm.strftime("%Y-%m-%d")
+
+    def _business_day_range_utc(ymd: str):
+        try:
+            return local_business_day_range_utc(ymd)
+        except Exception:
+            d = datetime.strptime(ymd, "%Y-%m-%d")
+            start_utc = datetime(d.year, d.month, d.day, 4, 0, 0)
+            end_utc   = start_utc + timedelta(days=1)
+            return start_utc, end_utc
+
+    def _totals_asof(end_utc: datetime):
+        rn = func.row_number().over(
+            partition_by=(RequestHeader.client_id, RequestItem.product_id),
+            order_by=(RequestHeader.created_at.desc(), RequestItem.id.desc()),
+        ).label("rn")
+
+        subq = (
+            db.session.query(
+                RequestHeader.client_id.label("client_id"),
+                RequestItem.product_id.label("product_id"),
+                RequestItem.qty_requested.label("qty"),
+                rn,
+            )
+            .join(RequestHeader, RequestItem.request_id == RequestHeader.id)
+            .filter(RequestHeader.status == "inviata")
+            .filter(RequestHeader.created_at <= end_utc)
+            .subquery()
+        )
+
+        latest_rows = (
+            db.session.query(
+                subq.c.client_id,
+                Product,
+                subq.c.qty,
+            )
+            .join(Product, Product.id == subq.c.product_id)
+            .join(Department, Department.id == Product.department_id)
+            .filter(subq.c.rn == 1)
+            .filter(func.lower(Department.macro_area).in_(list(areas_norm)))
+            .options(joinedload(Product.department))
+            .all()
+        )
+
+        totals = {}
+        for client_id, product, qty in latest_rows:
+            if not product or not product.department:
+                continue
+
+            shop_name = shop_label_by_id.get(client_id, str(client_id))
+            qty_dec = Decimal(str(qty or 0))
+            pid = product.id
+
+            rec = totals.setdefault(pid, {"product": product, "total": Decimal("0"), "breakdown": {}})
+            if qty_dec > 0:
+                rec["total"] += qty_dec
+                rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, Decimal("0")) + qty_dec
+            else:
+                rec["breakdown"].setdefault(shop_name, Decimal("0"))
+
+        rows_local = list(totals.values())
+        for rec in rows_local:
+            for name in shop_labels:
+                rec["breakdown"].setdefault(name, Decimal("0"))
+
+        if q:
+            rows_local = [r for r in rows_local if q in (r["product"].name or "").lower()]
+
+        rows_local.sort(
+            key=lambda r: (
+                (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
+                (r["product"].name.lower() if r["product"] and r["product"].name else ""),
+            )
+        )
+        return rows_local
+
+    # giorni storico (escludo oggi)
+    today_bd = _business_ymd_of(datetime.utcnow())
+    start_date = datetime.strptime(today_bd, "%Y-%m-%d").date()
+    last_ymd = [(start_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, days + 1)]
+
+    payload_days = []
+    for ymd in last_ymd:
+        _start_utc, end_utc = _business_day_range_utc(ymd)
+        rows_day = _totals_asof(end_utc)
+
+        # serializzo in JSON leggero
+        rows_json = []
+        for r in rows_day:
+            p = r["product"]
+            rows_json.append({
+                "department": (p.department.name if p and p.department else "Senza reparto"),
+                "product_name": (p.name or ""),
+                "total": float(r["total"]),
+                "breakdown": {k: float(v) for k, v in r["breakdown"].items()},
+            })
+
+        payload_days.append({
+            "date": datetime.strptime(ymd, "%Y-%m-%d").strftime("%d/%m/%Y"),
+            "rows": rows_json,
+        })
+
+    return jsonify({"days": payload_days})
+
+
+
+
+@app.route("/admin/giacenze")
+@login_required
+@require_role("admin")
+def admin_stock_totals():
+    from decimal import Decimal
+    from datetime import datetime, timedelta
+    import os
 
     q_raw = (request.args.get("q") or "").strip()
     q = q_raw.lower()
@@ -3195,55 +3331,30 @@ def admin_stock_totals():
     shop_label_by_id = {s.id: _shop_label(s) for s in shops}
     shop_labels = [shop_label_by_id[s.id] for s in shops]
 
-    # aree: le manteniamo, ma NON facciamo più una query per area.
-    # Le useremo per filtrare *solo* i prodotti ammessi (macro_area in lista).
+    # aree ammesse
     areas = list_macro_areas() or ["sala", "cucina"]
     areas_norm = {(a or "sala").lower() for a in areas}
 
-    # --- helper TZ / business-day ---
+    # --- helper TZ / business-day (serve anche per etichetta giorni lato history) ---
     def _to_rome(dt_utc: datetime) -> datetime:
         try:
             return to_rome(dt_utc)
         except Exception:
-            return dt_utc  # fallback neutro
+            return dt_utc
 
     def _business_ymd_of(dt_utc: datetime) -> str:
-        # business day = data di (Roma - 4 ore)
         rm = _to_rome(dt_utc) - timedelta(hours=4)
         return rm.strftime("%Y-%m-%d")
 
-    def _business_day_range_utc(ymd: str):
-        """Ritorna (start_utc, end_utc) della giornata di business (04:00→04:00 Roma)."""
-        try:
-            return local_business_day_range_utc(ymd)
-        except Exception:
-            # fallback se non hai la funzione
-            d = datetime.strptime(ymd, "%Y-%m-%d")
-            try:
-                start_rm = TZ_ROME.localize(datetime(d.year, d.month, d.day, 4, 0, 0))
-                end_rm = start_rm + timedelta(days=1)
-                return (
-                    start_rm.astimezone(datetime.timezone.utc).replace(tzinfo=None),
-                    end_rm.astimezone(datetime.timezone.utc).replace(tzinfo=None),
-                )
-            except Exception:
-                start_utc = datetime(d.year, d.month, d.day, 4, 0, 0)
-                end_utc = start_utc + timedelta(days=1)
-                return start_utc, end_utc
+    # giorni storico richiesti (default 5)
+    history_days = int(os.environ.get("STOCK_TOTALS_HISTORY_DAYS", "5"))
 
-    # ─────────────────────────────────────────────────────────────
-    # Helper: calcola totali "as of end_utc" in poche query:
-    #   1) subquery con row_number() per ottenere l'ultima riga per (client, product)
-    #   2) join a Product/Department per macro_area + eager load per template
-    # ─────────────────────────────────────────────────────────────
     def _totals_asof(end_utc: datetime):
-        # row_number per (client_id, product_id) ordinando per created_at desc
         rn = func.row_number().over(
             partition_by=(RequestHeader.client_id, RequestItem.product_id),
             order_by=(RequestHeader.created_at.desc(), RequestItem.id.desc()),
         ).label("rn")
 
-        # Subquery: tutte le righe candidate, con rn
         subq = (
             db.session.query(
                 RequestHeader.client_id.label("client_id"),
@@ -3257,41 +3368,30 @@ def admin_stock_totals():
             .subquery()
         )
 
-        # Query finale: prendo solo rn=1 (ultima riga per client+product)
-        # e join a Product/Department per macro_area e per avere i dati del template.
-        # joinedload evita N+1 su product.department e product.supplier.
         latest_rows = (
             db.session.query(
                 subq.c.client_id,
-                Product,                 # oggetto Product per template
+                Product,
                 subq.c.qty,
             )
             .join(Product, Product.id == subq.c.product_id)
             .join(Department, Department.id == Product.department_id)
             .filter(subq.c.rn == 1)
             .filter(func.lower(Department.macro_area).in_(list(areas_norm)))
-            .options(
-                joinedload(Product.department),
-            )
+            .options(joinedload(Product.department))
             .all()
         )
 
-        totals = {}  # product_id -> {"product": Product, "total": Decimal, "breakdown": {shop: Decimal}}
-
+        totals = {}
         for client_id, product, qty in latest_rows:
             if not product or not product.department:
                 continue
 
             shop_name = shop_label_by_id.get(client_id, str(client_id))
             qty_dec = Decimal(str(qty or 0))
-
             pid = product.id
-            rec = totals.setdefault(
-                pid,
-                {"product": product, "total": Decimal("0"), "breakdown": {}},
-            )
 
-            # Mantengo la tua logica: se qty <= 0, breakdown con 0
+            rec = totals.setdefault(pid, {"product": product, "total": Decimal("0"), "breakdown": {}})
             if qty_dec > 0:
                 rec["total"] += qty_dec
                 rec["breakdown"][shop_name] = rec["breakdown"].get(shop_name, Decimal("0")) + qty_dec
@@ -3299,17 +3399,13 @@ def admin_stock_totals():
                 rec["breakdown"].setdefault(shop_name, Decimal("0"))
 
         rows_local = list(totals.values())
-
-        # completa breakdown con negozi senza riga
         for rec in rows_local:
             for name in shop_labels:
                 rec["breakdown"].setdefault(name, Decimal("0"))
 
-        # filtro ricerca
         if q:
             rows_local = [r for r in rows_local if q in (r["product"].name or "").lower()]
 
-        # sort (come prima)
         rows_local.sort(
             key=lambda r: (
                 (r["product"].department.name.lower() if r["product"] and r["product"].department else ""),
@@ -3318,39 +3414,22 @@ def admin_stock_totals():
         )
         return rows_local
 
-    # ─────────────────────────────────────────────────────────────
-    # 1) Totali "correnti" as of now
-    # ─────────────────────────────────────────────────────────────
-    now_utc = datetime.utcnow()
-    rows = _totals_asof(now_utc)
+    # Totali correnti (oggi/now)
+    rows = _totals_asof(datetime.utcnow())
 
-    # ─────────────────────────────────────────────────────────────
-    # 2) Storico: nel template dici "ultimi 2 disponibili".
-    #    Prima calcolavi 7 giorni (molto lento). Qui default=2, configurabile.
-    # ─────────────────────────────────────────────────────────────
-    HISTORY_DAYS = int(os.environ.get("STOCK_TOTALS_HISTORY_DAYS", "5"))
-
-    today_bd = _business_ymd_of(datetime.utcnow())
-    start_date = datetime.strptime(today_bd, "%Y-%m-%d").date()
-    last_ymd = [(start_date - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, HISTORY_DAYS + 1)]
-
+    # NON calcoliamo lo storico qui: lo carichiamo lazy via /admin/giacenze/history
     previous_days = []
-    for ymd in last_ymd:
-        _start_utc, end_utc = _business_day_range_utc(ymd)
-        rows_day = _totals_asof(end_utc)
-        previous_days.append(
-            {
-                "date": datetime.strptime(ymd, "%Y-%m-%d").strftime("%d/%m/%Y"),
-                "rows": rows_day,
-            }
-        )
 
     return render_template(
         "admin/stock_totals.html",
         rows=rows,
         q=q_raw,
         previous_days=previous_days,
+        history_days=history_days,
     )
+
+
+
 
 
 
