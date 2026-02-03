@@ -60,7 +60,8 @@
         <div class="group-chip mt-3 mb-2">
           <div class="chip-title">{{ group.grouper or 'Senza reparto' }}</div>
           {% if sup.names|length == 1 %}
-    
+          {# se vuoi mostrare il fornitore unico qui, puoi farlo #}
+          {# <div class="chip-sub">{{ sup.names[0] }}</div> #}
           {% endif %}
         </div>
 
@@ -101,80 +102,181 @@
     {% endif %}
   </div>
 </div>
-{% if previous_days and previous_days|length > 0 %}
-  <div class="card shadow-sm mt-4 last-history-card">
-    <div class="card-body">
-      <div class="d-flex justify-content-between align-items-center mb-2">
-        <h2 class="h5 m-0 section-title">Storico giacenze totali (ultimi 5 disponibili)</h2>
-      </div>
 
-      <div class="accordion" id="totalsHistory">
-        {% for day in previous_days %}
-          {% set acc_id = 'day_' ~ loop.index %}
-          <div class="accordion-item" style="border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-bottom:10px;">
-            <h2 class="accordion-header" id="hdr-{{ acc_id }}">
-              <button class="accordion-button collapsed" type="button"
-                      data-bs-toggle="collapse"
-                      data-bs-target="#c-{{ acc_id }}"
-                      aria-expanded="false"
-                      aria-controls="c-{{ acc_id }}">
-                Totali del {{ day.date }}
-              </button>
-            </h2>
-            <div id="c-{{ acc_id }}" class="accordion-collapse collapse" aria-labelledby="hdr-{{ acc_id }}" data-bs-parent="#totalsHistory">
-              <div class="accordion-body">
-                {% if day.rows and day.rows|length > 0 %}
-                  {# Raggruppo per Reparto come nel blocco principale #}
-                  {% for group in day.rows|groupby('product.department.name') %}
-                    <div class="group-chip mt-2 mb-2">
-                      <div class="chip-title">{{ group.grouper or 'Senza reparto' }}</div>
-                    </div>
+{# ─────────────────────────────────────────────────────────────
+   STORICO (LAZY): NON arriva più da previous_days server-side.
+   Viene caricato quando l’utente apre l’accordion.
+   Richiede che tu passi history_days dal backend.
+   ───────────────────────────────────────────────────────────── #}
+<div class="card shadow-sm mt-4 last-history-card">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h2 class="h5 m-0 section-title">
+        Storico giacenze totali (ultimi {{ history_days or 5 }} disponibili)
+      </h2>
+    </div>
 
-                    <div class="table-responsive">
-                      <table class="table table-sm align-middle table-fixed w-100">
-                        <colgroup>
-                          <col style="width:55%">
-                          <col style="width:8ch">
-                          <col style="width:auto">
-                        </colgroup>
-                        <thead>
-                          <tr>
-                            <th>Prodotto</th>
-                            <th class="text-end">Totale</th>
-                            <th class="ps-4 border-start">Dettaglio per negozio</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {% for r in group.list %}
-                          <tr>
-                            <td class="fw-semibold">{{ r.product.name }}</td>
-                            <td class="text-end fw-semibold">{{ r.total|fmt_qty }}</td>
-                            <td class="text-muted ps-4 border-start">
-                              {% for client_name, qty in r.breakdown.items() %}
-                                <span class="me-2">{{ client_name }}: {{ qty|fmt_qty }}</span>
-                              {% endfor %}
-                            </td>
-                          </tr>
-                          {% endfor %}
-                        </tbody>
-                      </table>
-                    </div>
-                  {% endfor %}
-                {% else %}
-                  <div class="subtle">Nessun dato disponibile per questa giornata.</div>
-                {% endif %}
-              </div>
-            </div>
+    <div class="accordion" id="totalsHistory">
+      <div class="accordion-item" style="border:1px solid var(--border); border-radius:12px; overflow:hidden;">
+        <h2 class="accordion-header" id="hdr-history">
+          <button class="accordion-button collapsed" type="button"
+                  data-bs-toggle="collapse"
+                  data-bs-target="#c-history"
+                  aria-expanded="false"
+                  aria-controls="c-history">
+            Apri storico
+          </button>
+        </h2>
+        <div id="c-history" class="accordion-collapse collapse"
+             aria-labelledby="hdr-history" data-bs-parent="#totalsHistory">
+          <div class="accordion-body">
+            <div id="historyStatus" class="subtle">Caricamento…</div>
+            <div id="historyContainer"></div>
           </div>
-        {% endfor %}
+        </div>
       </div>
+    </div>
 
-      {% if previous_days|length == 1 %}
-        <div class="subtle small mt-2">Mostrata 1 giornata disponibile (non ci sono altre giornate recenti con dati).</div>
-      {% endif %}
+    <div class="subtle small mt-2">
+      * Lo storico viene caricato solo quando apri questa sezione.
     </div>
   </div>
-{% endif %}
+</div>
+
+<script>
+(function(){
+  let loaded = false;
+
+  function escHtml(s){
+    return String(s ?? "").replace(/[&<>"']/g, c => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+
+  function fmtQty(n){
+    if (n === null || n === undefined || Number.isNaN(n)) return "0";
+    // 2 decimali max, senza trailing inutili
+    const v = Math.round(Number(n) * 100) / 100;
+    return (Number.isInteger(v) ? String(v) : String(v));
+  }
+
+  function groupByDepartment(rows){
+    const map = new Map();
+    for (const r of (rows || [])){
+      const dept = r.department || "Senza reparto";
+      if (!map.has(dept)) map.set(dept, []);
+      map.get(dept).push(r);
+    }
+    return map;
+  }
+
+  function renderDay(day, container){
+    const wrap = document.createElement("div");
+    wrap.style.marginBottom = "16px";
+
+    const title = document.createElement("div");
+    title.className = "fw-semibold mb-2";
+    title.textContent = `Totali del ${day.date}`;
+    wrap.appendChild(title);
+
+    const grouped = groupByDepartment(day.rows);
+
+    for (const [dept, rows] of grouped.entries()){
+      const chip = document.createElement("div");
+      chip.className = "group-chip mt-2 mb-2";
+      chip.innerHTML = `<div class="chip-title">${escHtml(dept)}</div>`;
+      wrap.appendChild(chip);
+
+      const resp = document.createElement("div");
+      resp.className = "table-responsive";
+
+      const table = document.createElement("table");
+      table.className = "table table-sm align-middle table-fixed w-100";
+      table.innerHTML = `
+        <colgroup>
+          <col style="width:55%">
+          <col style="width:8ch">
+          <col style="width:auto">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Prodotto</th>
+            <th class="text-end">Totale</th>
+            <th class="ps-4 border-start">Dettaglio per negozio</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      `;
+
+      const tbody = table.querySelector("tbody");
+
+      for (const r of rows){
+        const breakdownTxt = Object.entries(r.breakdown || {})
+          .map(([k,v]) => `<span class="me-2">${escHtml(k)}: ${escHtml(fmtQty(v))}</span>`)
+          .join(" ");
+
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="fw-semibold">${escHtml(r.product_name)}</td>
+          <td class="text-end fw-semibold">${escHtml(fmtQty(r.total))}</td>
+          <td class="text-muted ps-4 border-start">${breakdownTxt}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      resp.appendChild(table);
+      wrap.appendChild(resp);
+    }
+
+    container.appendChild(wrap);
+  }
+
+  async function loadHistory(){
+    if (loaded) return;
+    loaded = true;
+
+    const statusEl = document.getElementById("historyStatus");
+    const container = document.getElementById("historyContainer");
+
+    const params = new URLSearchParams();
+    params.set("days", "{{ history_days or 5 }}");
+    {% if q %}
+      params.set("q", "{{ q|e }}");
+    {% endif %}
+
+    try{
+      const res = await fetch(`/admin/giacenze/history?${params.toString()}`, { credentials: "same-origin" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+
+      const data = await res.json();
+      if (statusEl) statusEl.remove();
+
+      const days = (data && data.days) ? data.days : [];
+      if (!days.length){
+        const empty = document.createElement("div");
+        empty.className = "subtle";
+        empty.textContent = "Nessun dato disponibile nello storico.";
+        container.appendChild(empty);
+        return;
+      }
+
+      for (const day of days){
+        renderDay(day, container);
+      }
+    } catch (e){
+      console.error(e);
+      if (statusEl) statusEl.textContent = "Errore nel caricamento dello storico.";
+    }
+  }
+
+  // Bootstrap collapse event
+  const collapseEl = document.getElementById("c-history");
+  if (collapseEl){
+    collapseEl.addEventListener("show.bs.collapse", loadHistory);
+  }
+})();
+</script>
+
 {% endblock %}
 
 <style>
