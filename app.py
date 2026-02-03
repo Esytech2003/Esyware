@@ -3855,29 +3855,6 @@ def admin_grid_save_ajax():
     })
 
 # ---------- CLI ----------
-@app.cli.command("init-db")
-def init_db_command():
-    """Inizializza il DB e crea dati demo."""
-    db.create_all()
-    ensure_seed_data()
-    print("DB inizializzato con dati demo. Utenti: admin/admin, client1/client1, client2/client2")
-
-if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
-        ensure_schema_upgrade()
-        ensure_seed_data()
-    port = int(os.environ.get("PORT", "5500"))
-    app.run(debug=True, host="0.0.0.0", port=port)
-
-@app.cli.command("reset-db")
-def reset_db_command():
-    """Drop & recreate tables, then seed demo data."""
-    db.drop_all()
-    db.create_all()
-    ensure_seed_data()
-    print("DB resettato e ripopolato.")
-
 
 from datetime import datetime, timedelta
 import os
