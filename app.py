@@ -226,6 +226,28 @@ class User(UserMixin, db.Model):
     def check_password(self, password: str) -> bool:
         return check_password_hash(self.password_hash, password)
 
+# ---------- EMERGENCY ADMIN (TEMPORARY) ----------
+def ensure_emergency_admin():
+    username = os.environ.get("EMERGENCY_ADMIN_USER", "admin_temp")
+    password = os.environ.get("EMERGENCY_ADMIN_PASS", "AdminTemp123!CambialaSubito")
+    display_name = os.environ.get("EMERGENCY_ADMIN_NAME", "Admin Temporaneo")
+
+    existing = User.query.filter_by(username=username).first()
+    if existing:
+        return
+
+    u = User(username=username, role="admin", display_name=display_name)
+    u.set_password(password)
+    db.session.add(u)
+    db.session.commit()
+    print(f"✅ Creato utente di emergenza: {username}")
+
+with app.app_context():
+    ensure_emergency_admin()
+# ---------- /EMERGENCY ADMIN ----------
+
+
+
 class Department(db.Model):
     __tablename__ = "departments"
     id = db.Column(db.Integer, primary_key=True)
