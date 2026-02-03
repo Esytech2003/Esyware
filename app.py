@@ -2709,9 +2709,10 @@ def admin_client_detail(client_id):
 @login_required
 @require_role("admin")
 def admin_requests():
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from collections import defaultdict
     import os, time
+    from sqlalchemy.orm import joinedload, selectinload
 
     t0 = time.time()
 
@@ -2720,13 +2721,14 @@ def admin_requests():
     from_str = (request.args.get("from") or "").strip()
     to_str   = (request.args.get("to")   or "").strip()
 
-    # Se NON ci sono filtri, limita quante richieste caricare (dashboard)
-    # (non taglia niente se filtri per data)
-    MAX_HEADERS = int(os.environ.get("ADMIN_REQUESTS_MAX_HEADERS", "500"))
-    use_limit = (not date_str and not from_str and not to_str)
+    has_filters = bool(date_str or from_str or to_str)
 
-    # Costruisco query UNA SOLA VOLTA con eager-load corretti
-    # selectinload evita mega-join e riduce N+1
+    # Default: ultimi 7 giorni SOLO se non ci sono filtri
+    DEFAULT_DAYS = int(os.environ.get("ADMIN_REQUESTS_DEFAULT_DAYS", "7"))
+
+    # (opzionale) paracadute numerico anche sui 7 giorni
+    MAX_HEADERS = int(os.environ.get("ADMIN_REQUESTS_MAX_HEADERS", "800"))
+
     q = (
         RequestHeader.query
         .filter(RequestHeader.status == "inviata")
@@ -2747,15 +2749,22 @@ def admin_requests():
     else:
         from_filter = from_str
         to_filter   = to_str
+
         if from_str:
             s, _ = local_day_range_utc(from_str)
             q = q.filter(RequestHeader.created_at >= s)
+
         if to_str:
             _, e = local_day_range_utc(to_str)
             q = q.filter(RequestHeader.created_at < e)
 
-    if use_limit:
-        q = q.limit(MAX_HEADERS)
+        # ✅ default veloce: ultimi 7 giorni se l'utente non filtra
+        if not has_filters:
+            cutoff = datetime.utcnow() - timedelta(days=DEFAULT_DAYS)
+            q = q.filter(RequestHeader.created_at >= cutoff)
+
+            # paracadute extra (opzionale)
+            q = q.limit(MAX_HEADERS)
 
     t1 = time.time()
     reqs = q.all()
@@ -2781,9 +2790,7 @@ def admin_requests():
 
     # ─────────────────────────────────────────────────────────────
     # Raggruppo tutte le richieste per (client_id, business_ymd) e per macro-area
-    # replicando la logica di combined_pairs_for_client_date_any_areas
     # ─────────────────────────────────────────────────────────────
-    # area_lists[(client_id, ymd)][area] = lista ordinata di {request_id, created_at, submitted_by}
     area_lists = defaultdict(lambda: defaultdict(list))
     client_name_by_id = {}
 
@@ -2791,14 +2798,13 @@ def admin_requests():
         if not rh.client_id or not rh.created_at:
             continue
 
-        # business day come prima
         ymd = _business_ymd(rh.created_at)
 
-        # nome client
         c = getattr(rh, "client", None)
-        client_name_by_id[rh.client_id] = (getattr(c, "display_name", None) or getattr(c, "username", None) or f"#{rh.client_id}")
+        client_name_by_id[rh.client_id] = (
+            getattr(c, "display_name", None) or getattr(c, "username", None) or f"#{rh.client_id}"
+        )
 
-        # deduco aree presenti nella richiesta (solo qty > 0)
         areas_in_rh = set()
         for it in (rh.items or []):
             try:
@@ -2822,13 +2828,13 @@ def admin_requests():
                 "submitted_by": getattr(rh, "submitted_by", None),
             })
 
-    # ordino ciascuna lista per created_at asc (come la tua funzione)
+    # ordina ciascuna lista per created_at asc
     for key, by_area in area_lists.items():
         for area, lst in by_area.items():
             lst.sort(key=lambda x: x["created_at"])
 
     # ─────────────────────────────────────────────────────────────
-    # Costruisco le card (rows) = una per (client, giorno, rank)
+    # Costruisco le card (rows)
     # ─────────────────────────────────────────────────────────────
     rows = []
     t3 = time.time()
@@ -2857,13 +2863,11 @@ def admin_requests():
 
             created_at = max(v["created_at"] for v in areas.values())
 
-            # expected = unione delle macro-aree abilitate degli invianti presenti nel bundle
             expected = set()
             for u in submitters:
                 expected |= _allowed_areas_for_user(u)
 
             if not expected:
-                # fallback come prima: atteso = aree presenti
                 expected = set(areas.keys())
 
             is_complete = expected.issubset(set(areas.keys()))
@@ -2877,13 +2881,11 @@ def admin_requests():
                 "date_str": ymd,
             })
 
-    # Ordina le card per tempo (discendente)
     rows.sort(key=lambda r: (r["created_at"] or datetime.min), reverse=True)
 
     t4 = time.time()
-
     print(
-        f"[admin_requests FAST] headers={len(reqs)} limit={use_limit} MAX_HEADERS={MAX_HEADERS} "
+        f"[admin_requests FAST7] filters={has_filters} default_days={DEFAULT_DAYS} headers={len(reqs)} "
         f"keys={len(area_lists)} rows={len(rows)} "
         f"t_fetch={(t2-t1):.2f}s t_build={(t4-t3):.2f}s t_total={(t4-t0):.2f}s"
     )
@@ -2895,6 +2897,7 @@ def admin_requests():
         from_filter=from_filter,
         to_filter=to_filter,
     )
+
 
 
 
