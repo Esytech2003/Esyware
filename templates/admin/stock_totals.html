@@ -127,10 +127,33 @@
             Apri storico
           </button>
         </h2>
+
         <div id="c-history" class="accordion-collapse collapse"
              aria-labelledby="hdr-history" data-bs-parent="#totalsHistory">
           <div class="accordion-body">
+
             <div id="historyStatus" class="subtle">Caricamento…</div>
+
+            <!-- controlli giorno -->
+            <div id="historyControls" class="d-none mb-3">
+              <div class="d-flex flex-wrap gap-2 align-items-end justify-content-between">
+                <div style="min-width:220px;">
+                  <label class="form-label small mb-1">Seleziona giorno</label>
+                  <select id="historyDaySelect" class="form-select rounded-4"></select>
+                </div>
+
+                <div class="d-flex gap-2">
+                  <button type="button" class="btn btn-outline-secondary rounded-4" id="historyPrevBtn">
+                    ←
+                  </button>
+                  <button type="button" class="btn btn-outline-secondary rounded-4" id="historyNextBtn">
+                    →
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- qui renderizziamo SOLO il giorno scelto -->
             <div id="historyContainer"></div>
           </div>
         </div>
@@ -142,6 +165,186 @@
     </div>
   </div>
 </div>
+
+<script>
+(function(){
+  let loaded = false;
+  let daysData = [];   // array di {date, rows}
+  let currentIndex = 0;
+
+  function escHtml(s){
+    return String(s ?? "").replace(/[&<>"']/g, c => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    }[c]));
+  }
+
+  function fmtQty(n){
+    if (n === null || n === undefined || Number.isNaN(n)) return "0";
+    const v = Math.round(Number(n) * 100) / 100;
+    return Number.isInteger(v) ? String(v) : String(v);
+  }
+
+  function groupByDepartment(rows){
+    const map = new Map();
+    for (const r of (rows || [])){
+      const dept = r.department || "Senza reparto";
+      if (!map.has(dept)) map.set(dept, []);
+      map.get(dept).push(r);
+    }
+    return map;
+  }
+
+  function renderSelectedDay(){
+    const container = document.getElementById("historyContainer");
+    container.innerHTML = "";
+
+    if (!daysData.length){
+      container.innerHTML = `<div class="subtle">Nessun dato disponibile nello storico.</div>`;
+      return;
+    }
+
+    const day = daysData[currentIndex];
+
+    // Titolo giornata
+    const title = document.createElement("div");
+    title.className = "fw-semibold mb-2";
+    title.textContent = `Totali del ${day.date}`;
+    container.appendChild(title);
+
+    const grouped = groupByDepartment(day.rows);
+
+    for (const [dept, rows] of grouped.entries()){
+      const chip = document.createElement("div");
+      chip.className = "group-chip mt-2 mb-2";
+      chip.innerHTML = `<div class="chip-title">${escHtml(dept)}</div>`;
+      container.appendChild(chip);
+
+      const resp = document.createElement("div");
+      resp.className = "table-responsive";
+
+      const table = document.createElement("table");
+      table.className = "table table-sm align-middle table-fixed w-100";
+      table.innerHTML = `
+        <colgroup>
+          <col style="width:55%">
+          <col style="width:8ch">
+          <col style="width:auto">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>Prodotto</th>
+            <th class="text-end">Totale</th>
+            <th class="ps-4 border-start">Dettaglio per negozio</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      `;
+
+      const tbody = table.querySelector("tbody");
+
+      for (const r of rows){
+        const breakdownTxt = Object.entries(r.breakdown || {})
+          .map(([k,v]) => `<span class="me-2">${escHtml(k)}: ${escHtml(fmtQty(v))}</span>`)
+          .join(" ");
+
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="fw-semibold">${escHtml(r.product_name)}</td>
+          <td class="text-end fw-semibold">${escHtml(fmtQty(r.total))}</td>
+          <td class="text-muted ps-4 border-start">${breakdownTxt}</td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      resp.appendChild(table);
+      container.appendChild(resp);
+    }
+
+    // aggiorna select e bottoni
+    const select = document.getElementById("historyDaySelect");
+    if (select) select.value = String(currentIndex);
+
+    const prevBtn = document.getElementById("historyPrevBtn");
+    const nextBtn = document.getElementById("historyNextBtn");
+    if (prevBtn) prevBtn.disabled = (currentIndex <= 0);
+    if (nextBtn) nextBtn.disabled = (currentIndex >= daysData.length - 1);
+  }
+
+  function initControls(){
+    const controls = document.getElementById("historyControls");
+    const select = document.getElementById("historyDaySelect");
+    const prevBtn = document.getElementById("historyPrevBtn");
+    const nextBtn = document.getElementById("historyNextBtn");
+
+    // popola select (mostro le date)
+    select.innerHTML = "";
+    daysData.forEach((d, idx) => {
+      const opt = document.createElement("option");
+      opt.value = String(idx);
+      opt.textContent = d.date;
+      select.appendChild(opt);
+    });
+
+    // default: giorno più recente (index 0) perché la tua API ritorna 1..N (ieri, 2gg fa,...)
+    currentIndex = 0;
+
+    select.addEventListener("change", () => {
+      currentIndex = parseInt(select.value, 10) || 0;
+      renderSelectedDay();
+    });
+
+    prevBtn.addEventListener("click", () => {
+      if (currentIndex > 0){
+        currentIndex -= 1;
+        renderSelectedDay();
+      }
+    });
+
+    nextBtn.addEventListener("click", () => {
+      if (currentIndex < daysData.length - 1){
+        currentIndex += 1;
+        renderSelectedDay();
+      }
+    });
+
+    controls.classList.remove("d-none");
+    renderSelectedDay();
+  }
+
+  async function loadHistory(){
+    if (loaded) return;
+    loaded = true;
+
+    const statusEl = document.getElementById("historyStatus");
+
+    const params = new URLSearchParams();
+    params.set("days", "{{ history_days or 5 }}");
+    {% if q %}
+      params.set("q", "{{ q|e }}");
+    {% endif %}
+
+    try{
+      const res = await fetch(`/admin/giacenze/history?${params.toString()}`, { credentials: "same-origin" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+
+      const data = await res.json();
+      if (statusEl) statusEl.remove();
+
+      daysData = (data && data.days) ? data.days : [];
+      initControls();
+    } catch (e){
+      console.error(e);
+      if (statusEl) statusEl.textContent = "Errore nel caricamento dello storico.";
+    }
+  }
+
+  const collapseEl = document.getElementById("c-history");
+  if (collapseEl){
+    collapseEl.addEventListener("show.bs.collapse", loadHistory);
+  }
+})();
+</script>
+
 
 <script>
 (function(){
