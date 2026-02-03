@@ -3272,7 +3272,6 @@ def admin_stock_totals():
             .filter(func.lower(Department.macro_area).in_(list(areas_norm)))
             .options(
                 joinedload(Product.department),
-                joinedload(Product.supplier),
             )
             .all()
         )
