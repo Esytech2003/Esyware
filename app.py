@@ -2719,90 +2719,172 @@ def admin_requests():
     from_str = (request.args.get("from") or "").strip()
     to_str   = (request.args.get("to")   or "").strip()
 
-    # LIMIT solo quando non ci sono filtri (pagina "dashboard")
-    # puoi cambiare questo valore su Render con env var ADMIN_REQUESTS_MAX_HEADERS
+    # Se NON ci sono filtri, limita quante richieste caricare (dashboard)
+    # (non taglia niente se filtri per data)
     MAX_HEADERS = int(os.environ.get("ADMIN_REQUESTS_MAX_HEADERS", "500"))
     use_limit = (not date_str and not from_str and not to_str)
 
-    base_q = (
-        db.session.query(
-            RequestHeader.client_id.label("client_id"),
-            RequestHeader.created_at.label("created_at"),
-            User.display_name.label("display_name"),
-            User.username.label("username"),
-        )
-        .join(User, User.id == RequestHeader.client_id)
+    # Costruisco query UNA SOLA VOLTA con eager-load corretti
+    # selectinload evita mega-join e riduce N+1
+    q = (
+        RequestHeader.query
         .filter(RequestHeader.status == "inviata")
+        .options(
+            joinedload(RequestHeader.client),
+            joinedload(RequestHeader.submitted_by),
+            selectinload(RequestHeader.items)
+                .selectinload(RequestItem.product)
+                .selectinload(Product.department),
+        )
         .order_by(RequestHeader.created_at.desc())
     )
 
     if date_str:
         s, e = local_day_range_utc(date_str)
-        base_q = base_q.filter(RequestHeader.created_at >= s, RequestHeader.created_at < e)
+        q = q.filter(RequestHeader.created_at >= s, RequestHeader.created_at < e)
         from_filter, to_filter = "", ""
     else:
         from_filter = from_str
         to_filter   = to_str
         if from_str:
             s, _ = local_day_range_utc(from_str)
-            base_q = base_q.filter(RequestHeader.created_at >= s)
+            q = q.filter(RequestHeader.created_at >= s)
         if to_str:
             _, e = local_day_range_utc(to_str)
-            base_q = base_q.filter(RequestHeader.created_at < e)
+            q = q.filter(RequestHeader.created_at < e)
 
     if use_limit:
-        base_q = base_q.limit(MAX_HEADERS)
+        q = q.limit(MAX_HEADERS)
 
     t1 = time.time()
-    all_reqs = base_q.all()
+    reqs = q.all()
     t2 = time.time()
 
-    # Giorni locali presenti per ogni client
-    ymd_by_client = defaultdict(set)
+    # Cache per allowed_macro_areas_for (evita chiamate ripetute)
+    allowed_cache = {}  # user_id -> set(areas)
+
+    def _allowed_areas_for_user(u):
+        if not u:
+            return set()
+        uid = getattr(u, "id", None)
+        if uid is None:
+            return set()
+        if uid in allowed_cache:
+            return allowed_cache[uid]
+        try:
+            areas = set(allowed_macro_areas_for(u))
+        except Exception:
+            areas = set()
+        allowed_cache[uid] = areas
+        return areas
+
+    # ─────────────────────────────────────────────────────────────
+    # Raggruppo tutte le richieste per (client_id, business_ymd) e per macro-area
+    # replicando la logica di combined_pairs_for_client_date_any_areas
+    # ─────────────────────────────────────────────────────────────
+    # area_lists[(client_id, ymd)][area] = lista ordinata di {request_id, created_at, submitted_by}
+    area_lists = defaultdict(lambda: defaultdict(list))
     client_name_by_id = {}
 
-    for client_id, created_at, display_name, username in all_reqs:
-        if not client_id or not created_at:
+    for rh in reqs:
+        if not rh.client_id or not rh.created_at:
             continue
-        ymd = _business_ymd(created_at)
-        ymd_by_client[client_id].add(ymd)
-        client_name_by_id[client_id] = display_name or username or f"#{client_id}"
 
-    # Costruisco le "righe" (card): una per (client, giorno, rank)
+        # business day come prima
+        ymd = _business_ymd(rh.created_at)
+
+        # nome client
+        c = getattr(rh, "client", None)
+        client_name_by_id[rh.client_id] = (getattr(c, "display_name", None) or getattr(c, "username", None) or f"#{rh.client_id}")
+
+        # deduco aree presenti nella richiesta (solo qty > 0)
+        areas_in_rh = set()
+        for it in (rh.items or []):
+            try:
+                if (it.qty_requested or 0) <= 0:
+                    continue
+                p = it.product
+                if not p or not p.department:
+                    continue
+                a = (p.department.macro_area or "sala").lower()
+                areas_in_rh.add(a)
+            except Exception:
+                continue
+
+        if not areas_in_rh:
+            areas_in_rh.add("sala")
+
+        for area in areas_in_rh:
+            area_lists[(rh.client_id, ymd)][area].append({
+                "request_id": rh.id,
+                "created_at": rh.created_at,
+                "submitted_by": getattr(rh, "submitted_by", None),
+            })
+
+    # ordino ciascuna lista per created_at asc (come la tua funzione)
+    for key, by_area in area_lists.items():
+        for area, lst in by_area.items():
+            lst.sort(key=lambda x: x["created_at"])
+
+    # ─────────────────────────────────────────────────────────────
+    # Costruisco le card (rows) = una per (client, giorno, rank)
+    # ─────────────────────────────────────────────────────────────
     rows = []
-    t_pairs_total = 0.0
-    pairs_calls = 0
-
-    for client_id, ymd_set in ymd_by_client.items():
-        client_name = client_name_by_id.get(client_id, f"#{client_id}")
-
-        # più recenti prima
-        for ymd in sorted(ymd_set, reverse=True):
-            tp0 = time.time()
-            pairs = combined_pairs_for_client_date_any_areas(client_id, ymd)
-            tp1 = time.time()
-
-            t_pairs_total += (tp1 - tp0)
-            pairs_calls += 1
-
-            for p in pairs:
-                rows.append({
-                    "client_id": client_id,
-                    "client_name": client_name,
-                    "rank": p["rank"],
-                    "created_at": p["created_at"],
-                    "is_complete": p["is_complete"],
-                    "date_str": ymd,
-                })
-
-    rows.sort(key=lambda r: (r["created_at"] or datetime.min), reverse=True)
-
     t3 = time.time()
 
+    for (client_id, ymd), by_area in area_lists.items():
+        client_name = client_name_by_id.get(client_id, f"#{client_id}")
+
+        n = max((len(lst) for lst in by_area.values()), default=0)
+
+        for i in range(n):
+            areas = {}
+            submitters = []
+
+            for area, lst in by_area.items():
+                if i < len(lst):
+                    rec = lst[i]
+                    areas[area] = {
+                        "request_id": rec["request_id"],
+                        "created_at": rec["created_at"],
+                    }
+                    if rec.get("submitted_by"):
+                        submitters.append(rec["submitted_by"])
+
+            if not areas:
+                continue
+
+            created_at = max(v["created_at"] for v in areas.values())
+
+            # expected = unione delle macro-aree abilitate degli invianti presenti nel bundle
+            expected = set()
+            for u in submitters:
+                expected |= _allowed_areas_for_user(u)
+
+            if not expected:
+                # fallback come prima: atteso = aree presenti
+                expected = set(areas.keys())
+
+            is_complete = expected.issubset(set(areas.keys()))
+
+            rows.append({
+                "client_id": client_id,
+                "client_name": client_name,
+                "rank": i + 1,
+                "created_at": created_at,
+                "is_complete": is_complete,
+                "date_str": ymd,
+            })
+
+    # Ordina le card per tempo (discendente)
+    rows.sort(key=lambda r: (r["created_at"] or datetime.min), reverse=True)
+
+    t4 = time.time()
+
     print(
-        f"[admin_requests] headers={len(all_reqs)} limit={use_limit} MAX_HEADERS={MAX_HEADERS} "
-        f"clients={len(ymd_by_client)} pairs_calls={pairs_calls} "
-        f"t_query={(t2-t1):.2f}s t_pairs={t_pairs_total:.2f}s t_total={(t3-t0):.2f}s"
+        f"[admin_requests FAST] headers={len(reqs)} limit={use_limit} MAX_HEADERS={MAX_HEADERS} "
+        f"keys={len(area_lists)} rows={len(rows)} "
+        f"t_fetch={(t2-t1):.2f}s t_build={(t4-t3):.2f}s t_total={(t4-t0):.2f}s"
     )
 
     return render_template(
