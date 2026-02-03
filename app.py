@@ -3858,6 +3858,7 @@ def admin_grid_save_ajax():
 
 from datetime import datetime, timedelta
 import os
+
 @app.cli.command("cleanup-retention")
 def cleanup_retention():
     """
@@ -3867,36 +3868,41 @@ def cleanup_retention():
     """
     days = int(os.environ.get("RETENTION_DAYS", "35"))
     cutoff = datetime.utcnow() - timedelta(days=days)
+
     # --- REQUESTS (giacenze) ---
     old_req_ids = [
         rid for (rid,) in db.session.query(RequestHeader.id)
         .filter(RequestHeader.created_at < cutoff)
         .all()
     ]
-    
+
     if old_req_ids:
-        # prima figli
         RequestItem.query.filter(RequestItem.request_id.in_(old_req_ids))\
             .delete(synchronize_session=False)
-        # poi testate
+
         RequestHeader.query.filter(RequestHeader.id.in_(old_req_ids))\
             .delete(synchronize_session=False)
+
     # --- PLANS (piani) ---
     old_plan_ids = [
         pid for (pid,) in db.session.query(DistributionPlan.id)
         .filter(DistributionPlan.created_at < cutoff)
         .all()
     ]
+
     if old_plan_ids:
-        # prima figli
         DistributionLine.query.filter(DistributionLine.plan_id.in_(old_plan_ids))\
             .delete(synchronize_session=False)
-        # poi testate
+
         DistributionPlan.query.filter(DistributionPlan.id.in_(old_plan_ids))\
             .delete(synchronize_session=False)
+
     db.session.commit()
-print(f"[cleanup-retention] OK days={days} cutoff={cutoff.isoformat()}Z "
-    f"deleted_requests={len(old_req_ids)} deleted_plans={len(old_plan_ids)}")
+
+    print(
+        f"[cleanup-retention] OK days={days} cutoff={cutoff.isoformat()}Z "
+        f"deleted_requests={len(old_req_ids)} deleted_plans={len(old_plan_ids)}"
+    )
 
 
 
