@@ -2703,19 +2703,27 @@ def admin_client_detail(client_id):
 
 
 
+
 @app.route("/admin/richieste")
 @login_required
 @require_role("admin")
 def admin_requests():
     from datetime import datetime
     from collections import defaultdict
+    import os, time
+
+    t0 = time.time()
 
     # Filtri: giorno singolo (date) oppure range (from/to)
     date_str = (request.args.get("date") or "").strip()
     from_str = (request.args.get("from") or "").strip()
     to_str   = (request.args.get("to")   or "").strip()
 
-    # Query "leggera": mi servono solo created_at + client_id + nome cliente
+    # LIMIT solo quando non ci sono filtri (pagina "dashboard")
+    # puoi cambiare questo valore su Render con env var ADMIN_REQUESTS_MAX_HEADERS
+    MAX_HEADERS = int(os.environ.get("ADMIN_REQUESTS_MAX_HEADERS", "500"))
+    use_limit = (not date_str and not from_str and not to_str)
+
     base_q = (
         db.session.query(
             RequestHeader.client_id.label("client_id"),
@@ -2725,6 +2733,7 @@ def admin_requests():
         )
         .join(User, User.id == RequestHeader.client_id)
         .filter(RequestHeader.status == "inviata")
+        .order_by(RequestHeader.created_at.desc())
     )
 
     if date_str:
@@ -2741,8 +2750,12 @@ def admin_requests():
             _, e = local_day_range_utc(to_str)
             base_q = base_q.filter(RequestHeader.created_at < e)
 
-    # IMPORTANTISSIMO: niente joinedload di items qui
-    all_reqs = base_q.order_by(RequestHeader.created_at.desc()).all()
+    if use_limit:
+        base_q = base_q.limit(MAX_HEADERS)
+
+    t1 = time.time()
+    all_reqs = base_q.all()
+    t2 = time.time()
 
     # Giorni locali presenti per ogni client
     ymd_by_client = defaultdict(set)
@@ -2753,19 +2766,25 @@ def admin_requests():
             continue
         ymd = _business_ymd(created_at)
         ymd_by_client[client_id].add(ymd)
-        # label client stabile
         client_name_by_id[client_id] = display_name or username or f"#{client_id}"
 
     # Costruisco le "righe" (card): una per (client, giorno, rank)
-    rows = []  # {"client_id","client_name","rank","created_at","is_complete","date_str"}
+    rows = []
+    t_pairs_total = 0.0
+    pairs_calls = 0
 
     for client_id, ymd_set in ymd_by_client.items():
         client_name = client_name_by_id.get(client_id, f"#{client_id}")
 
-        # puoi mettere reverse=True se vuoi prima i giorni più recenti
+        # più recenti prima
         for ymd in sorted(ymd_set, reverse=True):
-            # Manteniamo la tua logica esistente per rank/is_complete
+            tp0 = time.time()
             pairs = combined_pairs_for_client_date_any_areas(client_id, ymd)
+            tp1 = time.time()
+
+            t_pairs_total += (tp1 - tp0)
+            pairs_calls += 1
+
             for p in pairs:
                 rows.append({
                     "client_id": client_id,
@@ -2776,8 +2795,15 @@ def admin_requests():
                     "date_str": ymd,
                 })
 
-    # Ordina le card per tempo (discendente)
     rows.sort(key=lambda r: (r["created_at"] or datetime.min), reverse=True)
+
+    t3 = time.time()
+
+    print(
+        f"[admin_requests] headers={len(all_reqs)} limit={use_limit} MAX_HEADERS={MAX_HEADERS} "
+        f"clients={len(ymd_by_client)} pairs_calls={pairs_calls} "
+        f"t_query={(t2-t1):.2f}s t_pairs={t_pairs_total:.2f}s t_total={(t3-t0):.2f}s"
+    )
 
     return render_template(
         "admin/requests.html",
@@ -2786,6 +2812,7 @@ def admin_requests():
         from_filter=from_filter,
         to_filter=to_filter,
     )
+
 
 
 
