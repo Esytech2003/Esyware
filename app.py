@@ -10,6 +10,7 @@ from collections import defaultdict
 import io
 from decimal import Decimal, InvalidOperation
 from sqlalchemy import and_
+from sqlalchemy.orm import selectinload
 
 
 
